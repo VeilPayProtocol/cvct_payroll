@@ -115,6 +115,34 @@ pub mod cvct_payroll {
 
         Ok(())
     }
+
+    pub fn transfer_cvct(ctx: Context<TransferCvct>, amount: u64) -> Result<()> {
+        let from_cvct_account = &mut ctx.accounts.from_cvct_account;
+        let to_cvct_account = &mut ctx.accounts.to_cvct_account;
+
+        // 1. Check amount > 0
+        require!(amount > 0, CvctError::ZeroAmount);
+
+        // 2. Check balance
+        require!(
+            from_cvct_account.balance >= amount,
+            CvctError::InsufficientFunds
+        );
+
+        // 3. Debit sender
+        from_cvct_account.balance -= amount;
+
+        // 4. Credit receiver
+        to_cvct_account.balance += amount;
+
+        // No invariant change - total_supply unchanged, vault untouched
+
+        Ok(())
+    }
+
+    // ============================================
+    //                   Payroll
+    // ============================================
 }
 
 #[error_code]
@@ -161,6 +189,7 @@ pub enum CvctError {
     InvariantViolation,
     InvalidVault,
     Unauthorized,
+    ZeroAmount,
 }
 
 #[derive(Accounts)]
@@ -274,6 +303,23 @@ pub struct BurnAndWithdraw<'info> {
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct TransferCvct<'info> {
+    pub cvct_mint: Account<'info, CvctMint>,
+    #[account(
+        mut,
+        constraint = from_cvct_account.cvct_mint == cvct_mint.key(),
+        constraint = from_cvct_account.owner == from.key() @ CvctError::Unauthorized,
+    )]
+    pub from_cvct_account: Account<'info, CvctAccount>,
+    #[account(
+        mut,
+        constraint = to_cvct_account.cvct_mint == cvct_mint.key(),
+    )]
+    pub to_cvct_account: Account<'info, CvctAccount>,
+    pub from: Signer<'info>,
 }
 
 // ============================================
