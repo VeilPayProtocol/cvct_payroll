@@ -72,6 +72,49 @@ pub mod cvct_payroll {
 
         Ok(())
     }
+
+    pub fn burn_and_withdraw(ctx: Context<BurnAndWithdraw>, amount: u64) -> Result<()> {
+        let cvct_mint = &mut ctx.accounts.cvct_mint;
+        let vault = &mut ctx.accounts.vault;
+        let cvct_account = &mut ctx.accounts.cvct_account;
+
+        require!(cvct_account.balance >= amount, CvctError::InsufficientFunds);
+
+        // 1. Burn CVCT (update balances)
+        cvct_account.balance -= amount;
+        cvct_mint.total_supply -= amount;
+        vault.total_locked -= amount;
+
+        // 2. Transfer backing asset from vault to user
+        let authority_key = cvct_mint.authority;
+        let vault_seeds = &[
+            b"vault".as_ref(),
+            authority_key.as_ref(),
+            &[ctx.bumps.vault],
+        ];
+        let signer_seeds = &[&vault_seeds[..]];
+
+        transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.vault_token_account.to_account_info(),
+                    to: ctx.accounts.user_token_account.to_account_info(),
+                    authority: vault.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            amount,
+        )?;
+
+        // 3. Enforce invariant
+        require!(
+            cvct_mint.total_supply == vault.total_locked,
+            CvctError::InvariantViolation
+        );
+
+        Ok(())
+    }
 }
 
 #[error_code]
@@ -175,6 +218,39 @@ pub struct DepositAndMint<'info> {
     pub cvct_mint: Account<'info, CvctMint>,
     #[account(
         mut,
+        constraint = vault.cvct_mint == cvct_mint.key() @ CvctError::InvalidVault,
+    )]
+    pub vault: Account<'info, Vault>,
+    #[account(
+        mut,
+        constraint = cvct_account.cvct_mint == cvct_mint.key(),
+        constraint = cvct_account.owner == user.key() @ CvctError::Unauthorized,
+    )]
+    pub cvct_account: Account<'info, CvctAccount>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(
+        mut,
+        constraint = user_token_account.mint == cvct_mint.backing_mint,
+        constraint = user_token_account.owner == user.key(),
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = vault_token_account.key() == vault.backing_token_account,
+    )]
+    pub vault_token_account: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct BurnAndWithdraw<'info> {
+    #[account(mut)]
+    pub cvct_mint: Account<'info, CvctMint>,
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.authority.as_ref()],
+        bump,
         constraint = vault.cvct_mint == cvct_mint.key() @ CvctError::InvalidVault,
     )]
     pub vault: Account<'info, Vault>,
