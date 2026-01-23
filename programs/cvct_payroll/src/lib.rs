@@ -26,39 +26,16 @@ pub mod cvct_payroll {
 
         Ok(())
     }
-}
 
-#[derive(Accounts)]
-pub struct InitializeCvctMint<'info> {
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + CvctMint::INIT_SPACE,
-        seeds = [b"cvct_mint", authority.key().as_ref()],
-        bump,
-    )]
-    pub cvct_mint: Account<'info, CvctMint>,
-    #[account(
-        init,
-        payer = authority,
-        space = 8 + Vault::INIT_SPACE,
-        seeds = [b"vault", authority.key().as_ref()],
-        bump,
-    )]
-    pub vault: Account<'info, Vault>,
-    pub backing_mint: Account<'info, Mint>,
-    #[account(
-        init,
-        payer = authority,
-        associated_token::mint = backing_mint,
-        associated_token::authority = vault,
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub authority: Signer<'info>,
-    pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub fn initialize_cvct_account(ctx: Context<InitializeCvctAccount>) -> Result<()> {
+        let cvct_account = &mut ctx.accounts.cvct_account;
+
+        cvct_account.owner = ctx.accounts.owner.key();
+        cvct_account.cvct_mint = ctx.accounts.cvct_mint.key();
+        cvct_account.balance = 0;
+
+        Ok(())
+    }
 }
 
 #[error_code]
@@ -105,6 +82,55 @@ pub enum CvctError {
     InvariantViolation,
     InvalidVault,
     Unauthorized,
+}
+
+#[derive(Accounts)]
+pub struct InitializeCvctMint<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + CvctMint::INIT_SPACE,
+        seeds = [b"cvct_mint", authority.key().as_ref()],
+        bump,
+    )]
+    pub cvct_mint: Account<'info, CvctMint>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + Vault::INIT_SPACE,
+        seeds = [b"vault", authority.key().as_ref()],
+        bump,
+    )]
+    pub vault: Account<'info, Vault>,
+    pub backing_mint: Account<'info, Mint>,
+    #[account(
+        init,
+        payer = authority,
+        associated_token::mint = backing_mint,
+        associated_token::authority = vault,
+    )]
+    pub vault_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeCvctAccount<'info> {
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + CvctAccount::INIT_SPACE,
+        seeds = [b"cvct_account", cvct_mint.key().as_ref(), owner.key().as_ref()],
+        bump,
+    )]
+    pub cvct_account: Account<'info, CvctAccount>,
+    pub cvct_mint: Account<'info, CvctMint>,
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 // ============================================
