@@ -12,7 +12,7 @@ pub mod cvct_payroll {
     use super::*;
 
     // ============================================
-    //                   CVCT
+    //                   CVCT IX
     // ============================================
 
     pub fn initialize_cvct_mint(ctx: Context<InitializeCvctMint>) -> Result<()> {
@@ -141,7 +141,7 @@ pub mod cvct_payroll {
     }
 
     // ============================================
-    //                   Payroll
+    //                   Payroll IX
     // ============================================
 
     pub fn init_org(ctx: Context<InitOrg>) -> Result<()> {
@@ -152,6 +152,58 @@ pub mod cvct_payroll {
             cvct_mint: ctx.accounts.cvct_mint.key(),
             cvct_treasury_vault: ctx.accounts.treasury_vault.key(),
         });
+
+        Ok(())
+    }
+
+    pub fn init_org_treasury(ctx: Context<InitOrgTreasury>) -> Result<()> {
+        let org_treasury = &mut ctx.accounts.org_treasury;
+
+        org_treasury.set_inner(CvctAccount {
+            owner: ctx.accounts.org.key(),
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            balance: 0,
+        });
+
+        Ok(())
+    }
+
+    pub fn create_payroll(ctx: Context<CreatePayroll>, interval: i64) -> Result<()> {
+        let payroll = &mut ctx.accounts.payroll;
+
+        payroll.set_inner(Payroll {
+            org: ctx.accounts.org.key(),
+            interval,
+            last_run: 0,
+            active: true,
+        });
+
+        Ok(())
+    }
+
+    pub fn add_payroll_member(ctx: Context<AddPayrollMember>, rate: u64) -> Result<()> {
+        let payroll_member_state = &mut ctx.accounts.payroll_member_state;
+
+        payroll_member_state.set_inner(PayrollMember {
+            payroll: ctx.accounts.payroll.key(),
+            cvct_wallet: ctx.accounts.recipient_cvct_account.key(),
+            rate,
+            last_paid: 0,
+            active: true,
+        });
+
+        Ok(())
+    }
+
+    pub fn update_payroll_member(
+        ctx: Context<UpdatePayrollMember>,
+        new_rate: u64,
+        active: bool,
+    ) -> Result<()> {
+        let member = &mut ctx.accounts.member;
+
+        member.rate = new_rate;
+        member.active = active;
 
         Ok(())
     }
@@ -361,7 +413,7 @@ pub struct Payroll {
 
 pub struct PayrollMember {
     pub payroll: Pubkey,
-    pub wallet: Pubkey,
+    pub cvct_wallet: Pubkey,
     pub rate: u64, // CVCT per interval
     pub last_paid: i64,
     pub active: bool,
@@ -382,6 +434,96 @@ pub struct InitOrg<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitOrgTreasury<'info> {
+    #[account(
+        constraint = org.authority == admin.key() @ CvctError::Unauthorized,
+    )]
+    pub org: Account<'info, Organization>,
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + CvctAccount::INIT_SPACE,
+        seeds = [b"org_treasury", org.key().as_ref()],
+        bump,
+    )]
+    pub org_treasury: Account<'info, CvctAccount>,
+    #[account(
+        constraint = cvct_mint.key() == org.cvct_mint @ CvctError::InvalidVault,
+    )]
+    pub cvct_mint: Account<'info, CvctMint>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CreatePayroll<'info> {
+    #[account(
+        constraint = org.authority == admin.key() @ CvctError::Unauthorized,
+    )]
+    pub org: Account<'info, Organization>,
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + Payroll::INIT_SPACE,
+        seeds = [b"payroll", org.key().as_ref(), admin.key().as_ref()],
+        bump,
+    )]
+    pub payroll: Account<'info, Payroll>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AddPayrollMember<'info> {
+    #[account(
+        constraint = org.authority == admin.key() @ CvctError::Unauthorized,
+    )]
+    pub org: Account<'info, Organization>,
+    #[account(
+        constraint = payroll.org == org.key() @ CvctError::Unauthorized,
+    )]
+    pub payroll: Account<'info, Payroll>,
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + PayrollMember::INIT_SPACE,
+        seeds = [b"payroll_member", payroll.key().as_ref(), recipient.key().as_ref()],
+        bump,
+    )]
+    pub payroll_member_state: Account<'info, PayrollMember>,
+    /// CHECK: Member's wallet address, validated by CVCT account constraint
+    pub recipient: UncheckedAccount<'info>,
+    #[account(
+        constraint = recipient_cvct_account.owner == recipient.key() @ CvctError::Unauthorized,
+        constraint = recipient_cvct_account.cvct_mint == org.cvct_mint @ CvctError::InvalidVault,
+    )]
+    pub recipient_cvct_account: Account<'info, CvctAccount>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePayrollMember<'info> {
+    #[account(
+        constraint = org.authority == admin.key() @ CvctError::Unauthorized,
+    )]
+    pub org: Account<'info, Organization>,
+    #[account(
+        constraint = payroll.org == org.key() @ CvctError::Unauthorized,
+    )]
+    pub payroll: Account<'info, Payroll>,
+    #[account(
+        mut,
+        constraint = member.payroll == payroll.key() @ CvctError::Unauthorized,
+    )]
+    pub member: Account<'info, PayrollMember>,
+    pub admin: Signer<'info>,
 }
 
 /*

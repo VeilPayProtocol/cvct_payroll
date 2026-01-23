@@ -588,4 +588,864 @@ describe("CVCT Tests", () => {
       }
     });
   });
+
+  // ============================================
+  //          Init Organization Tests
+  // ============================================
+
+  describe("init_org", () => {
+    let orgAdmin: Keypair;
+    let orgPda: PublicKey;
+    let orgTreasuryPda: PublicKey;
+
+    before(async () => {
+      // Create org admin keypair
+      orgAdmin = Keypair.generate();
+
+      // Fund org admin from provider wallet
+      const fundOrgAdminTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: orgAdmin.publicKey,
+          lamports: 2 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundOrgAdminTx);
+
+      // Derive org PDA
+      [orgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), orgAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      // Derive org treasury CVCT account PDA
+      [orgTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          orgAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize org's treasury CVCT account
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: orgTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: orgAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([orgAdmin])
+        .rpc();
+    });
+
+    it("Happy path: successfully initializes an organization", async () => {
+      const tx = await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: orgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: orgTreasuryPda,
+          authority: orgAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([orgAdmin])
+        .rpc();
+
+      console.log("Init Org tx:", tx);
+
+      // Verify org state
+      const orgAccount = await program.account.organization.fetch(orgPda);
+      expect(orgAccount.authority.toString()).to.equal(
+        orgAdmin.publicKey.toString()
+      );
+      expect(orgAccount.cvctMint.toString()).to.equal(cvctMintPda.toString());
+      expect(orgAccount.cvctTreasuryVault.toString()).to.equal(
+        orgTreasuryPda.toString()
+      );
+    });
+
+    it("Unhappy path: fails to reinitialize existing organization", async () => {
+      try {
+        await program.methods
+          .initOrg()
+          .accountsPartial({
+            org: orgPda,
+            cvctMint: cvctMintPda,
+            treasuryVault: orgTreasuryPda,
+            authority: orgAdmin.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([orgAdmin])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        // Account already initialized - this is expected
+        expect(err.toString()).to.include("already in use");
+      }
+    });
+  });
+
+  // ============================================
+  //          Init Org Treasury Tests
+  // ============================================
+
+  describe("init_org_treasury", () => {
+    let orgAdmin2: Keypair;
+    let org2Pda: PublicKey;
+    let org2TreasuryPda: PublicKey;
+    let orgTreasuryPda2: PublicKey;
+
+    before(async () => {
+      // Create a second org admin for these tests
+      orgAdmin2 = Keypair.generate();
+
+      // Fund org admin
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: orgAdmin2.publicKey,
+          lamports: 2 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Derive PDAs
+      [org2Pda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), orgAdmin2.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [org2TreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          orgAdmin2.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [orgTreasuryPda2] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org_treasury"), org2Pda.toBuffer()],
+        program.programId
+      );
+
+      // Initialize org's personal treasury CVCT account first
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: org2TreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: orgAdmin2.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([orgAdmin2])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: org2Pda,
+          cvctMint: cvctMintPda,
+          treasuryVault: org2TreasuryPda,
+          authority: orgAdmin2.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([orgAdmin2])
+        .rpc();
+    });
+
+    it("Happy path: successfully initializes org treasury", async () => {
+      const tx = await program.methods
+        .initOrgTreasury()
+        .accountsPartial({
+          org: org2Pda,
+          orgTreasury: orgTreasuryPda2,
+          cvctMint: cvctMintPda,
+          admin: orgAdmin2.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([orgAdmin2])
+        .rpc();
+
+      console.log("Init Org Treasury tx:", tx);
+
+      // Verify treasury state
+      const treasuryAccount = await program.account.cvctAccount.fetch(
+        orgTreasuryPda2
+      );
+      expect(treasuryAccount.owner.toString()).to.equal(org2Pda.toString());
+      expect(treasuryAccount.cvctMint.toString()).to.equal(
+        cvctMintPda.toString()
+      );
+      expect(treasuryAccount.balance.toNumber()).to.equal(0);
+    });
+
+    it("Unhappy path: non-admin cannot initialize org treasury", async () => {
+      const attacker = Keypair.generate();
+      const victimOrgAdmin = Keypair.generate();
+
+      // Fund attacker and victim org admin
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: attacker.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        }),
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: victimOrgAdmin.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Create a fresh org for the victim (without treasury initialized)
+      const [victimOrgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), victimOrgAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      // Create a CVCT account for victim org's treasury vault (required for init_org)
+      const [victimTreasuryVaultPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("cvct_account"), cvctMintPda.toBuffer(), victimOrgAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: victimTreasuryVaultPda,
+          cvctMint: cvctMintPda,
+          owner: victimOrgAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([victimOrgAdmin])
+        .rpc();
+
+      // Initialize the victim org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: victimOrgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: victimTreasuryVaultPda,
+          authority: victimOrgAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([victimOrgAdmin])
+        .rpc();
+
+      // Derive the treasury PDA for victim org (which attacker is not admin of)
+      const [victimOrgTreasuryPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org_treasury"), victimOrgPda.toBuffer()],
+        program.programId
+      );
+
+      try {
+        await program.methods
+          .initOrgTreasury()
+          .accountsPartial({
+            org: victimOrgPda, // Trying to use victim's org
+            orgTreasury: victimOrgTreasuryPda,
+            cvctMint: cvctMintPda,
+            admin: attacker.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([attacker])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("Unauthorized");
+      }
+    });
+  });
+
+  // ============================================
+  //          Create Payroll Tests
+  // ============================================
+
+  describe("create_payroll", () => {
+    let payrollPda: PublicKey;
+    let orgAdminForPayroll: Keypair;
+    let orgForPayrollPda: PublicKey;
+    let orgForPayrollTreasuryPda: PublicKey;
+
+    before(async () => {
+      // Use a fresh org admin for payroll tests
+      orgAdminForPayroll = Keypair.generate();
+
+      // Fund org admin
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: orgAdminForPayroll.publicKey,
+          lamports: 3 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Derive PDAs
+      [orgForPayrollPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), orgAdminForPayroll.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [orgForPayrollTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          orgAdminForPayroll.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [payrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          orgForPayrollPda.toBuffer(),
+          orgAdminForPayroll.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize treasury account
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: orgForPayrollTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: orgAdminForPayroll.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([orgAdminForPayroll])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: orgForPayrollPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: orgForPayrollTreasuryPda,
+          authority: orgAdminForPayroll.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([orgAdminForPayroll])
+        .rpc();
+    });
+
+    it("Happy path: successfully creates a payroll", async () => {
+      const interval = new anchor.BN(86400); // 1 day in seconds
+
+      const tx = await program.methods
+        .createPayroll(interval)
+        .accountsPartial({
+          org: orgForPayrollPda,
+          payroll: payrollPda,
+          admin: orgAdminForPayroll.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([orgAdminForPayroll])
+        .rpc();
+
+      console.log("Create Payroll tx:", tx);
+
+      // Verify payroll state
+      const payrollAccount = await program.account.payroll.fetch(payrollPda);
+      expect(payrollAccount.org.toString()).to.equal(
+        orgForPayrollPda.toString()
+      );
+      expect(payrollAccount.interval.toNumber()).to.equal(86400);
+      expect(payrollAccount.lastRun.toNumber()).to.equal(0);
+      expect(payrollAccount.active).to.equal(true);
+    });
+
+    it("Unhappy path: non-admin cannot create payroll", async () => {
+      const attacker = Keypair.generate();
+
+      // Fund attacker
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: attacker.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      const [attackerPayrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          orgForPayrollPda.toBuffer(),
+          attacker.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      try {
+        await program.methods
+          .createPayroll(new anchor.BN(86400))
+          .accountsPartial({
+            org: orgForPayrollPda,
+            payroll: attackerPayrollPda,
+            admin: attacker.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([attacker])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("Unauthorized");
+      }
+    });
+  });
+
+  // ============================================
+  //          Add Payroll Member Tests
+  // ============================================
+
+  describe("add_payroll_member", () => {
+    let memberAdmin: Keypair;
+    let memberOrgPda: PublicKey;
+    let memberOrgTreasuryPda: PublicKey;
+    let memberPayrollPda: PublicKey;
+    let employeeWallet: Keypair;
+    let employeeCvctAccountPda: PublicKey;
+    let payrollMemberPda: PublicKey;
+
+    before(async () => {
+      // Setup org admin
+      memberAdmin = Keypair.generate();
+
+      // Fund admin
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: memberAdmin.publicKey,
+          lamports: 3 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Derive PDAs
+      [memberOrgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), memberAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [memberOrgTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          memberAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [memberPayrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          memberOrgPda.toBuffer(),
+          memberAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Setup employee
+      employeeWallet = Keypair.generate();
+
+      // Fund employee
+      const fundEmployeeTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: employeeWallet.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundEmployeeTx);
+
+      [employeeCvctAccountPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          employeeWallet.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [payrollMemberPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll_member"),
+          memberPayrollPda.toBuffer(),
+          employeeWallet.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize treasury
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: memberOrgTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: memberAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([memberAdmin])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: memberOrgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: memberOrgTreasuryPda,
+          authority: memberAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([memberAdmin])
+        .rpc();
+
+      // Create payroll
+      await program.methods
+        .createPayroll(new anchor.BN(86400))
+        .accountsPartial({
+          org: memberOrgPda,
+          payroll: memberPayrollPda,
+          admin: memberAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([memberAdmin])
+        .rpc();
+
+      // Initialize employee's CVCT account
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: employeeCvctAccountPda,
+          cvctMint: cvctMintPda,
+          owner: employeeWallet.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([employeeWallet])
+        .rpc();
+    });
+
+    it("Happy path: successfully adds a payroll member", async () => {
+      const rate = new anchor.BN(1000_000_000); // 1 CVCT per interval
+
+      const tx = await program.methods
+        .addPayrollMember(rate)
+        .accountsPartial({
+          org: memberOrgPda,
+          payroll: memberPayrollPda,
+          payrollMemberState: payrollMemberPda,
+          recipient: employeeWallet.publicKey,
+          recipientCvctAccount: employeeCvctAccountPda,
+          admin: memberAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([memberAdmin])
+        .rpc();
+
+      console.log("Add Payroll Member tx:", tx);
+
+      // Verify member state
+      const memberAccount = await program.account.payrollMember.fetch(
+        payrollMemberPda
+      );
+      expect(memberAccount.payroll.toString()).to.equal(
+        memberPayrollPda.toString()
+      );
+      expect(memberAccount.cvctWallet.toString()).to.equal(
+        employeeCvctAccountPda.toString()
+      );
+      expect(memberAccount.rate.toNumber()).to.equal(1000_000_000);
+      expect(memberAccount.lastPaid.toNumber()).to.equal(0);
+      expect(memberAccount.active).to.equal(true);
+    });
+
+    it("Unhappy path: non-admin cannot add payroll member", async () => {
+      const attacker = Keypair.generate();
+      const newEmployee = Keypair.generate();
+
+      // Fund attacker and new employee
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: attacker.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        }),
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: newEmployee.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Initialize new employee's CVCT account
+      const [newEmployeeCvctPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          newEmployee.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: newEmployeeCvctPda,
+          cvctMint: cvctMintPda,
+          owner: newEmployee.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([newEmployee])
+        .rpc();
+
+      const [newMemberPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll_member"),
+          memberPayrollPda.toBuffer(),
+          newEmployee.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      try {
+        await program.methods
+          .addPayrollMember(new anchor.BN(500_000_000))
+          .accountsPartial({
+            org: memberOrgPda,
+            payroll: memberPayrollPda,
+            payrollMemberState: newMemberPda,
+            recipient: newEmployee.publicKey,
+            recipientCvctAccount: newEmployeeCvctPda,
+            admin: attacker.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([attacker])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("Unauthorized");
+      }
+    });
+  });
+
+  // ============================================
+  //          Update Payroll Member Tests
+  // ============================================
+
+  describe("update_payroll_member", () => {
+    let updateAdmin: Keypair;
+    let updateOrgPda: PublicKey;
+    let updateOrgTreasuryPda: PublicKey;
+    let updatePayrollPda: PublicKey;
+    let updateEmployeeWallet: Keypair;
+    let updateEmployeeCvctPda: PublicKey;
+    let updateMemberPda: PublicKey;
+
+    before(async () => {
+      // Setup org admin
+      updateAdmin = Keypair.generate();
+
+      // Fund admin
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: updateAdmin.publicKey,
+          lamports: 3 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Derive PDAs
+      [updateOrgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), updateAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [updateOrgTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          updateAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [updatePayrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          updateOrgPda.toBuffer(),
+          updateAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Setup employee
+      updateEmployeeWallet = Keypair.generate();
+
+      // Fund employee
+      const fundEmployeeTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: updateEmployeeWallet.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundEmployeeTx);
+
+      [updateEmployeeCvctPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          updateEmployeeWallet.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [updateMemberPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll_member"),
+          updatePayrollPda.toBuffer(),
+          updateEmployeeWallet.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize treasury
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: updateOrgTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: updateAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([updateAdmin])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: updateOrgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: updateOrgTreasuryPda,
+          authority: updateAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([updateAdmin])
+        .rpc();
+
+      // Create payroll
+      await program.methods
+        .createPayroll(new anchor.BN(86400))
+        .accountsPartial({
+          org: updateOrgPda,
+          payroll: updatePayrollPda,
+          admin: updateAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([updateAdmin])
+        .rpc();
+
+      // Initialize employee's CVCT account
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: updateEmployeeCvctPda,
+          cvctMint: cvctMintPda,
+          owner: updateEmployeeWallet.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([updateEmployeeWallet])
+        .rpc();
+
+      // Add payroll member
+      await program.methods
+        .addPayrollMember(new anchor.BN(1000_000_000))
+        .accountsPartial({
+          org: updateOrgPda,
+          payroll: updatePayrollPda,
+          payrollMemberState: updateMemberPda,
+          recipient: updateEmployeeWallet.publicKey,
+          recipientCvctAccount: updateEmployeeCvctPda,
+          admin: updateAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([updateAdmin])
+        .rpc();
+    });
+
+    it("Happy path: successfully updates payroll member", async () => {
+      const newRate = new anchor.BN(2000_000_000); // Double the rate
+      const active = false; // Deactivate
+
+      const tx = await program.methods
+        .updatePayrollMember(newRate, active)
+        .accountsPartial({
+          org: updateOrgPda,
+          payroll: updatePayrollPda,
+          member: updateMemberPda,
+          admin: updateAdmin.publicKey,
+        })
+        .signers([updateAdmin])
+        .rpc();
+
+      console.log("Update Payroll Member tx:", tx);
+
+      // Verify updated state
+      const memberAccount = await program.account.payrollMember.fetch(
+        updateMemberPda
+      );
+      expect(memberAccount.rate.toNumber()).to.equal(2000_000_000);
+      expect(memberAccount.active).to.equal(false);
+    });
+
+    it("Unhappy path: non-admin cannot update payroll member", async () => {
+      const attacker = Keypair.generate();
+
+      // Fund attacker
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: attacker.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      try {
+        await program.methods
+          .updatePayrollMember(new anchor.BN(999_000_000), true)
+          .accountsPartial({
+            org: updateOrgPda,
+            payroll: updatePayrollPda,
+            member: updateMemberPda,
+            admin: attacker.publicKey,
+          })
+          .signers([attacker])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("Unauthorized");
+      }
+    });
+  });
+
 });
