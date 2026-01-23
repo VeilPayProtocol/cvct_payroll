@@ -207,6 +207,71 @@ pub mod cvct_payroll {
 
         Ok(())
     }
+
+    pub fn run_payroll_for_member(ctx: Context<RunPayrollForMember>) -> Result<()> {
+        let payroll = &ctx.accounts.payroll;
+        let member = &mut ctx.accounts.payroll_member_state;
+        let org_treasury = &mut ctx.accounts.org_treasury;
+        let member_cvct_account = &mut ctx.accounts.member_cvct_account;
+
+        // 1. Check payroll is active
+        require!(payroll.active, CvctError::PayrollNotActive);
+
+        // 2. Check member is active
+        require!(member.active, CvctError::MemberNotActive);
+
+        // 3. Get current timestamp
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp;
+
+        // 4. Calculate periods owed since last payment
+        let time_elapsed = now - member.last_paid;
+        let periods_owed = if member.last_paid == 0 {
+            // First payment - pay one period
+            1_i64
+        } else {
+            time_elapsed / payroll.interval
+        };
+
+        // 5. Check if payment is due
+        require!(periods_owed > 0, CvctError::PayrollNotDue);
+
+        // 6. Calculate total owed
+        let amount_owed = member.rate * (periods_owed as u64);
+
+        // 7. Check treasury has sufficient funds
+        require!(
+            org_treasury.balance >= amount_owed,
+            CvctError::InsufficientFunds
+        );
+
+        // 8. Transfer CVCT from treasury to member
+        org_treasury.balance -= amount_owed;
+        member_cvct_account.balance += amount_owed;
+
+        // 9. Update last_paid to current time
+        member.last_paid = now;
+
+        Ok(())
+    }
+
+    pub fn pause_payroll(ctx: Context<PausePayroll>) -> Result<()> {
+        ctx.accounts.payroll.active = false;
+        Ok(())
+    }
+
+    pub fn resume_payroll(ctx: Context<ResumePayroll>) -> Result<()> {
+        ctx.accounts.payroll.active = true;
+        Ok(())
+    }
+
+    pub fn close_payroll(ctx: Context<ClosePayroll>) -> Result<()> {
+        require!(
+            !ctx.accounts.payroll.active,
+            CvctError::MustPauseFirst
+        );
+        Ok(())
+    }
 }
 
 #[error_code]
@@ -254,6 +319,10 @@ pub enum CvctError {
     InvalidVault,
     Unauthorized,
     ZeroAmount,
+    MemberNotActive,
+    PayrollNotActive,
+    PayrollNotDue,
+    MustPauseFirst,
 }
 
 #[derive(Accounts)]
@@ -523,6 +592,74 @@ pub struct UpdatePayrollMember<'info> {
         constraint = payroll_member_state.payroll == payroll.key() @ CvctError::Unauthorized,
     )]
     pub payroll_member_state: Account<'info, PayrollMember>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RunPayrollForMember<'info> {
+    pub org: Account<'info, Organization>,
+    #[account(
+        constraint = payroll.org == org.key() @ CvctError::Unauthorized,
+    )]
+    pub payroll: Account<'info, Payroll>,
+    #[account(
+        mut,
+        constraint = payroll_member_state.payroll == payroll.key() @ CvctError::Unauthorized,
+    )]
+    pub payroll_member_state: Account<'info, PayrollMember>,
+    #[account(
+        mut,
+        constraint = org_treasury.key() == org.cvct_treasury_vault @ CvctError::InvalidVault,
+    )]
+    pub org_treasury: Account<'info, CvctAccount>,
+    #[account(
+        mut,
+        constraint = member_cvct_account.key() == payroll_member_state.cvct_wallet @ CvctError::Unauthorized,
+    )]
+    pub member_cvct_account: Account<'info, CvctAccount>,
+}
+
+#[derive(Accounts)]
+pub struct PausePayroll<'info> {
+    #[account(
+        constraint = org.authority == admin.key() @ CvctError::Unauthorized,
+    )]
+    pub org: Account<'info, Organization>,
+    #[account(
+        mut,
+        constraint = payroll.org == org.key() @ CvctError::Unauthorized,
+    )]
+    pub payroll: Account<'info, Payroll>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ResumePayroll<'info> {
+    #[account(
+        constraint = org.authority == admin.key() @ CvctError::Unauthorized,
+    )]
+    pub org: Account<'info, Organization>,
+    #[account(
+        mut,
+        constraint = payroll.org == org.key() @ CvctError::Unauthorized,
+    )]
+    pub payroll: Account<'info, Payroll>,
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ClosePayroll<'info> {
+    #[account(
+        constraint = org.authority == admin.key() @ CvctError::Unauthorized,
+    )]
+    pub org: Account<'info, Organization>,
+    #[account(
+        mut,
+        close = admin,
+        constraint = payroll.org == org.key() @ CvctError::Unauthorized,
+    )]
+    pub payroll: Account<'info, Payroll>,
+    #[account(mut)]
     pub admin: Signer<'info>,
 }
 

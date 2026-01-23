@@ -1448,4 +1448,956 @@ describe("CVCT Tests", () => {
     });
   });
 
+  // ============================================
+  //          Run Payroll For Member Tests
+  // ============================================
+
+  describe("run_payroll_for_member", () => {
+    let runPayrollAdmin: Keypair;
+    let runPayrollOrgPda: PublicKey;
+    let runPayrollOrgTreasuryPda: PublicKey;
+    let runPayrollPayrollPda: PublicKey;
+    let runPayrollEmployeeWallet: Keypair;
+    let runPayrollEmployeeCvctPda: PublicKey;
+    let runPayrollMemberPda: PublicKey;
+
+    before(async () => {
+      // Setup org admin
+      runPayrollAdmin = Keypair.generate();
+
+      // Fund admin
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: runPayrollAdmin.publicKey,
+          lamports: 5 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Derive PDAs
+      [runPayrollOrgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), runPayrollAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [runPayrollOrgTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          runPayrollAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [runPayrollPayrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          runPayrollOrgPda.toBuffer(),
+          runPayrollAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Setup employee
+      runPayrollEmployeeWallet = Keypair.generate();
+
+      // Fund employee
+      const fundEmployeeTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: runPayrollEmployeeWallet.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundEmployeeTx);
+
+      [runPayrollEmployeeCvctPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          runPayrollEmployeeWallet.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [runPayrollMemberPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll_member"),
+          runPayrollPayrollPda.toBuffer(),
+          runPayrollEmployeeWallet.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize treasury
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: runPayrollOrgTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: runPayrollAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: runPayrollOrgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: runPayrollOrgTreasuryPda,
+          authority: runPayrollAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+
+      // Create payroll with 1 second interval for testing
+      await program.methods
+        .createPayroll(new anchor.BN(1))
+        .accountsPartial({
+          org: runPayrollOrgPda,
+          payroll: runPayrollPayrollPda,
+          admin: runPayrollAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+
+      // Initialize employee's CVCT account
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: runPayrollEmployeeCvctPda,
+          cvctMint: cvctMintPda,
+          owner: runPayrollEmployeeWallet.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([runPayrollEmployeeWallet])
+        .rpc();
+
+      // Add payroll member with rate of 100 CVCT per interval
+      await program.methods
+        .addPayrollMember(new anchor.BN(100_000_000))
+        .accountsPartial({
+          org: runPayrollOrgPda,
+          payroll: runPayrollPayrollPda,
+          payrollMemberState: runPayrollMemberPda,
+          recipient: runPayrollEmployeeWallet.publicKey,
+          recipientCvctAccount: runPayrollEmployeeCvctPda,
+          admin: runPayrollAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+
+      // Fund the org treasury with CVCT by depositing backing tokens
+      // First, create admin's token account and mint backing tokens
+      const adminAta = await getOrCreateAssociatedTokenAccount(
+        connection,
+        runPayrollAdmin,
+        backingMint,
+        runPayrollAdmin.publicKey
+      );
+
+      // Mint backing tokens to admin
+      await mintTo(
+        connection,
+        authority,
+        backingMint,
+        adminAta.address,
+        authority,
+        1_000_000_000_000 // 1000 tokens
+      );
+
+      // Deposit and mint CVCT to admin's treasury account
+      await program.methods
+        .depositAndMint(new anchor.BN(1_000_000_000_000))
+        .accountsPartial({
+          cvctMint: cvctMintPda,
+          vault: vaultPda,
+          cvctAccount: runPayrollOrgTreasuryPda,
+          user: runPayrollAdmin.publicKey,
+          userTokenAccount: adminAta.address,
+          vaultTokenAccount: vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+    });
+
+    it("Happy path: successfully runs payroll for member", async () => {
+      const treasuryBefore = await program.account.cvctAccount.fetch(
+        runPayrollOrgTreasuryPda
+      );
+      const employeeBefore = await program.account.cvctAccount.fetch(
+        runPayrollEmployeeCvctPda
+      );
+
+      const tx = await program.methods
+        .runPayrollForMember()
+        .accountsPartial({
+          org: runPayrollOrgPda,
+          payroll: runPayrollPayrollPda,
+          payrollMemberState: runPayrollMemberPda,
+          orgTreasury: runPayrollOrgTreasuryPda,
+          memberCvctAccount: runPayrollEmployeeCvctPda,
+        })
+        .rpc();
+
+      console.log("Run Payroll For Member tx:", tx);
+
+      // Verify state changes
+      const treasuryAfter = await program.account.cvctAccount.fetch(
+        runPayrollOrgTreasuryPda
+      );
+      const employeeAfter = await program.account.cvctAccount.fetch(
+        runPayrollEmployeeCvctPda
+      );
+      const memberAfter = await program.account.payrollMember.fetch(
+        runPayrollMemberPda
+      );
+
+      // Check treasury decreased by rate
+      expect(treasuryAfter.balance.toNumber()).to.equal(
+        treasuryBefore.balance.toNumber() - 100_000_000
+      );
+
+      // Check employee received payment
+      expect(employeeAfter.balance.toNumber()).to.equal(
+        employeeBefore.balance.toNumber() + 100_000_000
+      );
+
+      // Check last_paid was updated
+      expect(memberAfter.lastPaid.toNumber()).to.be.greaterThan(0);
+    });
+
+    it("Unhappy path: fails when payroll is paused", async () => {
+      // Pause the payroll first
+      await program.methods
+        .pausePayroll()
+        .accountsPartial({
+          org: runPayrollOrgPda,
+          payroll: runPayrollPayrollPda,
+          admin: runPayrollAdmin.publicKey,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+
+      try {
+        await program.methods
+          .runPayrollForMember()
+          .accountsPartial({
+            org: runPayrollOrgPda,
+            payroll: runPayrollPayrollPda,
+            payrollMemberState: runPayrollMemberPda,
+            orgTreasury: runPayrollOrgTreasuryPda,
+            memberCvctAccount: runPayrollEmployeeCvctPda,
+          })
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("PayrollNotActive");
+      }
+
+      // Resume payroll for other tests
+      await program.methods
+        .resumePayroll()
+        .accountsPartial({
+          org: runPayrollOrgPda,
+          payroll: runPayrollPayrollPda,
+          admin: runPayrollAdmin.publicKey,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+    });
+
+    it("Unhappy path: fails when member is inactive", async () => {
+      // Deactivate the member
+      await program.methods
+        .updatePayrollMember(new anchor.BN(100_000_000), false)
+        .accountsPartial({
+          org: runPayrollOrgPda,
+          payroll: runPayrollPayrollPda,
+          payrollMemberState: runPayrollMemberPda,
+          admin: runPayrollAdmin.publicKey,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+
+      try {
+        await program.methods
+          .runPayrollForMember()
+          .accountsPartial({
+            org: runPayrollOrgPda,
+            payroll: runPayrollPayrollPda,
+            payrollMemberState: runPayrollMemberPda,
+            orgTreasury: runPayrollOrgTreasuryPda,
+            memberCvctAccount: runPayrollEmployeeCvctPda,
+          })
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("MemberNotActive");
+      }
+
+      // Reactivate member for other tests
+      await program.methods
+        .updatePayrollMember(new anchor.BN(100_000_000), true)
+        .accountsPartial({
+          org: runPayrollOrgPda,
+          payroll: runPayrollPayrollPda,
+          payrollMemberState: runPayrollMemberPda,
+          admin: runPayrollAdmin.publicKey,
+        })
+        .signers([runPayrollAdmin])
+        .rpc();
+    });
+
+    it("Unhappy path: fails when treasury has insufficient funds", async () => {
+      // Create a new org with empty treasury for this test
+      const poorAdmin = Keypair.generate();
+
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: poorAdmin.publicKey,
+          lamports: 3 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      const [poorOrgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), poorAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      const [poorTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          poorAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      const [poorPayrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          poorOrgPda.toBuffer(),
+          poorAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      const poorEmployee = Keypair.generate();
+      const fundEmployeeTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: poorEmployee.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundEmployeeTx);
+
+      const [poorEmployeeCvctPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          poorEmployee.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      const [poorMemberPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll_member"),
+          poorPayrollPda.toBuffer(),
+          poorEmployee.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize treasury (empty)
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: poorTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: poorAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([poorAdmin])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: poorOrgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: poorTreasuryPda,
+          authority: poorAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([poorAdmin])
+        .rpc();
+
+      // Create payroll
+      await program.methods
+        .createPayroll(new anchor.BN(1))
+        .accountsPartial({
+          org: poorOrgPda,
+          payroll: poorPayrollPda,
+          admin: poorAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([poorAdmin])
+        .rpc();
+
+      // Initialize employee's CVCT account
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: poorEmployeeCvctPda,
+          cvctMint: cvctMintPda,
+          owner: poorEmployee.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([poorEmployee])
+        .rpc();
+
+      // Add payroll member
+      await program.methods
+        .addPayrollMember(new anchor.BN(100_000_000))
+        .accountsPartial({
+          org: poorOrgPda,
+          payroll: poorPayrollPda,
+          payrollMemberState: poorMemberPda,
+          recipient: poorEmployee.publicKey,
+          recipientCvctAccount: poorEmployeeCvctPda,
+          admin: poorAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([poorAdmin])
+        .rpc();
+
+      try {
+        await program.methods
+          .runPayrollForMember()
+          .accountsPartial({
+            org: poorOrgPda,
+            payroll: poorPayrollPda,
+            payrollMemberState: poorMemberPda,
+            orgTreasury: poorTreasuryPda,
+            memberCvctAccount: poorEmployeeCvctPda,
+          })
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("InsufficientFunds");
+      }
+    });
+  });
+
+  // ============================================
+  //          Pause Payroll Tests
+  // ============================================
+
+  describe("pause_payroll", () => {
+    let pauseAdmin: Keypair;
+    let pauseOrgPda: PublicKey;
+    let pauseOrgTreasuryPda: PublicKey;
+    let pausePayrollPda: PublicKey;
+
+    before(async () => {
+      pauseAdmin = Keypair.generate();
+
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: pauseAdmin.publicKey,
+          lamports: 3 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      [pauseOrgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), pauseAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [pauseOrgTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          pauseAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [pausePayrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          pauseOrgPda.toBuffer(),
+          pauseAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize treasury
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: pauseOrgTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: pauseAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([pauseAdmin])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: pauseOrgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: pauseOrgTreasuryPda,
+          authority: pauseAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([pauseAdmin])
+        .rpc();
+
+      // Create payroll
+      await program.methods
+        .createPayroll(new anchor.BN(86400))
+        .accountsPartial({
+          org: pauseOrgPda,
+          payroll: pausePayrollPda,
+          admin: pauseAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([pauseAdmin])
+        .rpc();
+    });
+
+    it("Happy path: successfully pauses payroll", async () => {
+      const payrollBefore = await program.account.payroll.fetch(pausePayrollPda);
+      expect(payrollBefore.active).to.equal(true);
+
+      const tx = await program.methods
+        .pausePayroll()
+        .accountsPartial({
+          org: pauseOrgPda,
+          payroll: pausePayrollPda,
+          admin: pauseAdmin.publicKey,
+        })
+        .signers([pauseAdmin])
+        .rpc();
+
+      console.log("Pause Payroll tx:", tx);
+
+      const payrollAfter = await program.account.payroll.fetch(pausePayrollPda);
+      expect(payrollAfter.active).to.equal(false);
+    });
+
+    it("Unhappy path: non-admin cannot pause payroll", async () => {
+      const attacker = Keypair.generate();
+
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: attacker.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // First resume the payroll so we can test pause again
+      await program.methods
+        .resumePayroll()
+        .accountsPartial({
+          org: pauseOrgPda,
+          payroll: pausePayrollPda,
+          admin: pauseAdmin.publicKey,
+        })
+        .signers([pauseAdmin])
+        .rpc();
+
+      try {
+        await program.methods
+          .pausePayroll()
+          .accountsPartial({
+            org: pauseOrgPda,
+            payroll: pausePayrollPda,
+            admin: attacker.publicKey,
+          })
+          .signers([attacker])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("Unauthorized");
+      }
+    });
+  });
+
+  // ============================================
+  //          Resume Payroll Tests
+  // ============================================
+
+  describe("resume_payroll", () => {
+    let resumeAdmin: Keypair;
+    let resumeOrgPda: PublicKey;
+    let resumeOrgTreasuryPda: PublicKey;
+    let resumePayrollPda: PublicKey;
+
+    before(async () => {
+      resumeAdmin = Keypair.generate();
+
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: resumeAdmin.publicKey,
+          lamports: 3 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      [resumeOrgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), resumeAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [resumeOrgTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          resumeAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [resumePayrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          resumeOrgPda.toBuffer(),
+          resumeAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize treasury
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: resumeOrgTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: resumeAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([resumeAdmin])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: resumeOrgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: resumeOrgTreasuryPda,
+          authority: resumeAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([resumeAdmin])
+        .rpc();
+
+      // Create payroll
+      await program.methods
+        .createPayroll(new anchor.BN(86400))
+        .accountsPartial({
+          org: resumeOrgPda,
+          payroll: resumePayrollPda,
+          admin: resumeAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([resumeAdmin])
+        .rpc();
+
+      // Pause payroll first
+      await program.methods
+        .pausePayroll()
+        .accountsPartial({
+          org: resumeOrgPda,
+          payroll: resumePayrollPda,
+          admin: resumeAdmin.publicKey,
+        })
+        .signers([resumeAdmin])
+        .rpc();
+    });
+
+    it("Happy path: successfully resumes payroll", async () => {
+      const payrollBefore = await program.account.payroll.fetch(resumePayrollPda);
+      expect(payrollBefore.active).to.equal(false);
+
+      const tx = await program.methods
+        .resumePayroll()
+        .accountsPartial({
+          org: resumeOrgPda,
+          payroll: resumePayrollPda,
+          admin: resumeAdmin.publicKey,
+        })
+        .signers([resumeAdmin])
+        .rpc();
+
+      console.log("Resume Payroll tx:", tx);
+
+      const payrollAfter = await program.account.payroll.fetch(resumePayrollPda);
+      expect(payrollAfter.active).to.equal(true);
+    });
+
+    it("Unhappy path: non-admin cannot resume payroll", async () => {
+      const attacker = Keypair.generate();
+
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: attacker.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Pause payroll first
+      await program.methods
+        .pausePayroll()
+        .accountsPartial({
+          org: resumeOrgPda,
+          payroll: resumePayrollPda,
+          admin: resumeAdmin.publicKey,
+        })
+        .signers([resumeAdmin])
+        .rpc();
+
+      try {
+        await program.methods
+          .resumePayroll()
+          .accountsPartial({
+            org: resumeOrgPda,
+            payroll: resumePayrollPda,
+            admin: attacker.publicKey,
+          })
+          .signers([attacker])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("Unauthorized");
+      }
+    });
+  });
+
+  // ============================================
+  //          Close Payroll Tests
+  // ============================================
+
+  describe("close_payroll", () => {
+    let closeAdmin: Keypair;
+    let closeOrgPda: PublicKey;
+    let closeOrgTreasuryPda: PublicKey;
+    let closePayrollPda: PublicKey;
+
+    before(async () => {
+      closeAdmin = Keypair.generate();
+
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: closeAdmin.publicKey,
+          lamports: 3 * anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      [closeOrgPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("org"), closeAdmin.publicKey.toBuffer()],
+        program.programId
+      );
+
+      [closeOrgTreasuryPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("cvct_account"),
+          cvctMintPda.toBuffer(),
+          closeAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      [closePayrollPda] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("payroll"),
+          closeOrgPda.toBuffer(),
+          closeAdmin.publicKey.toBuffer(),
+        ],
+        program.programId
+      );
+
+      // Initialize treasury
+      await program.methods
+        .initializeCvctAccount()
+        .accountsPartial({
+          cvctAccount: closeOrgTreasuryPda,
+          cvctMint: cvctMintPda,
+          owner: closeAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([closeAdmin])
+        .rpc();
+
+      // Initialize org
+      await program.methods
+        .initOrg()
+        .accountsPartial({
+          org: closeOrgPda,
+          cvctMint: cvctMintPda,
+          treasuryVault: closeOrgTreasuryPda,
+          authority: closeAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([closeAdmin])
+        .rpc();
+
+      // Create payroll
+      await program.methods
+        .createPayroll(new anchor.BN(86400))
+        .accountsPartial({
+          org: closeOrgPda,
+          payroll: closePayrollPda,
+          admin: closeAdmin.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([closeAdmin])
+        .rpc();
+    });
+
+    it("Unhappy path: cannot close active payroll", async () => {
+      const payroll = await program.account.payroll.fetch(closePayrollPda);
+      expect(payroll.active).to.equal(true);
+
+      try {
+        await program.methods
+          .closePayroll()
+          .accountsPartial({
+            org: closeOrgPda,
+            payroll: closePayrollPda,
+            admin: closeAdmin.publicKey,
+          })
+          .signers([closeAdmin])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("MustPauseFirst");
+      }
+    });
+
+    it("Unhappy path: non-admin cannot close payroll", async () => {
+      const attacker = Keypair.generate();
+
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: provider.wallet.publicKey,
+          toPubkey: attacker.publicKey,
+          lamports: anchor.web3.LAMPORTS_PER_SOL,
+        })
+      );
+      await sendAndConfirmTx(fundTx);
+
+      // Pause the payroll first
+      await program.methods
+        .pausePayroll()
+        .accountsPartial({
+          org: closeOrgPda,
+          payroll: closePayrollPda,
+          admin: closeAdmin.publicKey,
+        })
+        .signers([closeAdmin])
+        .rpc();
+
+      try {
+        await program.methods
+          .closePayroll()
+          .accountsPartial({
+            org: closeOrgPda,
+            payroll: closePayrollPda,
+            admin: attacker.publicKey,
+          })
+          .signers([attacker])
+          .rpc();
+
+        expect.fail("Should have thrown an error");
+      } catch (err) {
+        expect(err.toString()).to.include("Unauthorized");
+      }
+
+      // Resume for happy path test
+      await program.methods
+        .resumePayroll()
+        .accountsPartial({
+          org: closeOrgPda,
+          payroll: closePayrollPda,
+          admin: closeAdmin.publicKey,
+        })
+        .signers([closeAdmin])
+        .rpc();
+    });
+
+    it("Happy path: successfully closes paused payroll", async () => {
+      // Pause the payroll first
+      await program.methods
+        .pausePayroll()
+        .accountsPartial({
+          org: closeOrgPda,
+          payroll: closePayrollPda,
+          admin: closeAdmin.publicKey,
+        })
+        .signers([closeAdmin])
+        .rpc();
+
+      const adminBalanceBefore = await connection.getBalance(closeAdmin.publicKey);
+
+      const tx = await program.methods
+        .closePayroll()
+        .accountsPartial({
+          org: closeOrgPda,
+          payroll: closePayrollPda,
+          admin: closeAdmin.publicKey,
+        })
+        .signers([closeAdmin])
+        .rpc();
+
+      console.log("Close Payroll tx:", tx);
+
+      // Verify payroll account is closed (fetch should fail)
+      try {
+        await program.account.payroll.fetch(closePayrollPda);
+        expect.fail("Account should have been closed");
+      } catch (err) {
+        expect(err.toString()).to.include("Account does not exist");
+      }
+
+      // Verify admin received rent back
+      const adminBalanceAfter = await connection.getBalance(closeAdmin.publicKey);
+      expect(adminBalanceAfter).to.be.greaterThan(adminBalanceBefore);
+    });
+  });
+
 });
