@@ -143,6 +143,18 @@ pub mod cvct_payroll {
     // ============================================
     //                   Payroll
     // ============================================
+
+    pub fn init_org(ctx: Context<InitOrg>) -> Result<()> {
+        let org = &mut ctx.accounts.org;
+
+        org.set_inner(Organization {
+            authority: ctx.accounts.authority.key(),
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            cvct_treasury_vault: ctx.accounts.treasury_vault.key(),
+        });
+
+        Ok(())
+    }
 }
 
 #[error_code]
@@ -327,9 +339,54 @@ pub struct TransferCvct<'info> {
 // ============================================
 
 #[account]
-pub struct Config {
+#[derive(InitSpace)]
+pub struct Organization {
     pub authority: Pubkey,
     pub cvct_mint: Pubkey,
-    pub treasury_vault: Pubkey,
-    pub fee_bps: u16,
+    pub cvct_treasury_vault: Pubkey,
 }
+
+#[account]
+#[derive(InitSpace)]
+
+pub struct Payroll {
+    pub org: Pubkey,
+    pub interval: i64,
+    pub last_run: i64,
+    pub active: bool,
+}
+
+#[account]
+#[derive(InitSpace)]
+
+pub struct PayrollMember {
+    pub payroll: Pubkey,
+    pub wallet: Pubkey,
+    pub rate: u64, // CVCT per interval
+    pub last_paid: i64,
+    pub active: bool,
+}
+
+#[derive(Accounts)]
+pub struct InitOrg<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + Organization::INIT_SPACE,
+        seeds = [b"org", authority.key().as_ref()],
+        bump,
+    )]
+    pub org: Account<'info, Organization>,
+    pub cvct_mint: Account<'info, CvctMint>,
+    pub treasury_vault: Account<'info, CvctAccount>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+/*
+require_keys_eq!(org.authority, signer.key());
+require_keys_eq!(org.cvct_mint, cvct_mint.key());
+require_keys_eq!(org.cvct_treasury_vault, treasury_vault.key());
+
+*/
