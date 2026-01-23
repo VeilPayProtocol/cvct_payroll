@@ -200,7 +200,7 @@ pub mod cvct_payroll {
         new_rate: u64,
         active: bool,
     ) -> Result<()> {
-        let member = &mut ctx.accounts.member;
+        let member = &mut ctx.accounts.payroll_member_state;
 
         member.rate = new_rate;
         member.active = active;
@@ -520,9 +520,9 @@ pub struct UpdatePayrollMember<'info> {
     pub payroll: Account<'info, Payroll>,
     #[account(
         mut,
-        constraint = member.payroll == payroll.key() @ CvctError::Unauthorized,
+        constraint = payroll_member_state.payroll == payroll.key() @ CvctError::Unauthorized,
     )]
-    pub member: Account<'info, PayrollMember>,
+    pub payroll_member_state: Account<'info, PayrollMember>,
     pub admin: Signer<'info>,
 }
 

@@ -1400,7 +1400,7 @@ describe("CVCT Tests", () => {
         .accountsPartial({
           org: updateOrgPda,
           payroll: updatePayrollPda,
-          member: updateMemberPda,
+          payrollMemberState: updateMemberPda,
           admin: updateAdmin.publicKey,
         })
         .signers([updateAdmin])
@@ -1435,7 +1435,7 @@ describe("CVCT Tests", () => {
           .accountsPartial({
             org: updateOrgPda,
             payroll: updatePayrollPda,
-            member: updateMemberPda,
+            payrollMemberState: updateMemberPda,
             admin: attacker.publicKey,
           })
           .signers([attacker])
