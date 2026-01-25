@@ -3,11 +3,10 @@ use anchor_spl::{
     associated_token::AssociatedToken,
     token::{transfer, Mint, Token, TokenAccount, Transfer},
 };
-use arcium_anchor::prelude::*;
 
 declare_id!("Sd92uPUtbHdnoRFmi6xCEsLVh4Yg3KYcNbGXeSJVL5R");
 
-#[arcium_program]
+#[program]
 pub mod cvct_payroll {
     use super::*;
 
@@ -266,10 +265,7 @@ pub mod cvct_payroll {
     }
 
     pub fn close_payroll(ctx: Context<ClosePayroll>) -> Result<()> {
-        require!(
-            !ctx.accounts.payroll.active,
-            CvctError::MustPauseFirst
-        );
+        require!(!ctx.accounts.payroll.active, CvctError::MustPauseFirst);
         Ok(())
     }
 }
