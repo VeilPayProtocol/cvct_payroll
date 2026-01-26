@@ -184,10 +184,10 @@ function deriveCvctMintPda(
 
 function deriveVaultPda(
   programId: PublicKey,
-  authority: PublicKey
+  cvctMint: PublicKey
 ): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [Buffer.from("vault"), authority.toBuffer()],
+    [Buffer.from("vault"), cvctMint.toBuffer()],
     programId
   );
 }
@@ -288,7 +288,7 @@ async function initializeCvctInfrastructure(
   backingMint: PublicKey
 ): Promise<{ cvctMintPda: PublicKey; vaultPda: PublicKey; vaultTokenAccount: PublicKey }> {
   const [cvctMintPda] = deriveCvctMintPda(program.programId, payer.publicKey);
-  const [vaultPda] = deriveVaultPda(program.programId, payer.publicKey);
+  const [vaultPda] = deriveVaultPda(program.programId, cvctMintPda);
   const vaultTokenAccount = await getAssociatedTokenAddress(
     backingMint,
     vaultPda,

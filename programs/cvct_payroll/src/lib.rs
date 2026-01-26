@@ -259,12 +259,13 @@ pub mod cvct_payroll {
         vault.total_locked = new_locked;
 
         // 5. Transfer backing asset from vault to user
-        // Note: This transfers the full amount - the e_select ensures encrypted state
-        // is only updated if sufficient. For production, consider decryption verification.
-        let authority_key = cvct_mint.authority;
+        // NOTE: SPL transfer uses plaintext amount.
+        // Restricted to mint authority to prevent unauthorized withdrawals.
+        // Future versions will gate transfer by decrypted burn_amount.
+        let cvct_mint_key = cvct_mint.key();
         let vault_seeds = &[
             b"vault".as_ref(),
-            authority_key.as_ref(),
+            cvct_mint_key.as_ref(),
             &[ctx.bumps.vault],
         ];
         let signer_seeds = &[&vault_seeds[..]];
@@ -432,7 +433,6 @@ pub mod cvct_payroll {
         payroll.set_inner(Payroll {
             org: ctx.accounts.org.key(),
             interval,
-            last_run: 0,
             active: true,
         });
 
@@ -596,6 +596,10 @@ pub mod cvct_payroll {
             e_add(cpi_ctx7, member_cvct_account.balance, transfer_amount, 0u8)?;
         member_cvct_account.balance = new_member_balance;
 
+        // INVARIANT: Treasury debit equals member credit (same transfer_amount)
+        // No mint/burn occurs in payroll → total_supply remains unchanged
+        // Therefore: sum(all cvct_account balances) == total_supply (preserved)
+
         // 12. Update last_paid to current time
         member.last_paid = now;
 
@@ -721,7 +725,7 @@ pub struct InitializeCvctMint<'info> {
         init,
         payer = authority,
         space = 8 + Vault::LEN,
-        seeds = [b"vault", authority.key().as_ref()],
+        seeds = [b"vault", cvct_mint.key().as_ref()],
         bump,
     )]
     pub vault: Account<'info, Vault>,
@@ -768,6 +772,8 @@ pub struct DepositAndMint<'info> {
     pub cvct_mint: Account<'info, CvctMint>,
     #[account(
         mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
         constraint = vault.cvct_mint == cvct_mint.key() @ CvctError::InvalidVault,
     )]
     pub vault: Account<'info, Vault>,
@@ -803,7 +809,7 @@ pub struct BurnAndWithdraw<'info> {
     pub cvct_mint: Account<'info, CvctMint>,
     #[account(
         mut,
-        seeds = [b"vault", cvct_mint.authority.as_ref()],
+        seeds = [b"vault", cvct_mint.key().as_ref()],
         bump,
         constraint = vault.cvct_mint == cvct_mint.key() @ CvctError::InvalidVault,
     )]
@@ -814,7 +820,12 @@ pub struct BurnAndWithdraw<'info> {
         constraint = cvct_account.owner == user.key() @ CvctError::Unauthorized,
     )]
     pub cvct_account: Account<'info, CvctAccount>,
-    #[account(mut)]
+    /// SECURITY: Only CVCT mint authority can burn and withdraw to prevent
+    /// unauthorized drainage of SPL tokens from vault
+    #[account(
+        mut,
+        constraint = user.key() == cvct_mint.authority @ CvctError::Unauthorized,
+    )]
     pub user: Signer<'info>,
     #[account(
         mut,
@@ -869,7 +880,8 @@ pub struct Organization {
 }
 
 impl Organization {
-    // 32 (authority) + 32 (cvct_mint) + 32 (treasury) + 1 + 32 (Option<Pubkey>)
+    // 32 (authority) + 32 (cvct_mint) + 32 (treasury) + 33 (Option<Pubkey>)
+    // Option<Pubkey> = 1 byte tag + 32 bytes value
     pub const LEN: usize = 32 + 32 + 32 + 1 + 32;
 }
 
@@ -878,7 +890,6 @@ impl Organization {
 pub struct Payroll {
     pub org: Pubkey,
     pub interval: i64,
-    pub last_run: i64,
     pub active: bool,
 }
 
