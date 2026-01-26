@@ -4,8 +4,8 @@ use anchor_spl::{
     token::{transfer, Mint, Token, TokenAccount, Transfer},
 };
 use inco_lightning::cpi::accounts::{Allow, Operation};
-use inco_lightning::cpi::{allow, as_euint128, e_add, e_ge, e_select, e_sub, new_euint128};
-use inco_lightning::types::{Ebool, Euint128};
+use inco_lightning::cpi::{allow, as_euint128, e_add, e_ge, e_mul, e_select, e_sub, new_euint128};
+use inco_lightning::types::Euint128;
 use inco_lightning::ID as INCO_LIGHTNING_ID;
 
 declare_id!("Sd92uPUtbHdnoRFmi6xCEsLVh4Yg3KYcNbGXeSJVL5R");
@@ -450,13 +450,23 @@ pub mod cvct_payroll {
         Ok(())
     }
 
-    pub fn add_payroll_member(ctx: Context<AddPayrollMember>, rate: u64) -> Result<()> {
+    /// Add a member to payroll with encrypted rate
+    pub fn add_payroll_member<'info>(
+        ctx: Context<'_, '_, '_, 'info, AddPayrollMember<'info>>,
+        rate: u64,
+    ) -> Result<()> {
         let payroll_member_state = &mut ctx.accounts.payroll_member_state;
+        let inco = ctx.accounts.inco_lightning_program.to_account_info();
+        let signer = ctx.accounts.admin.to_account_info();
+
+        // Convert rate to encrypted value
+        let cpi_ctx = CpiContext::new(inco, Operation { signer });
+        let encrypted_rate = as_euint128(cpi_ctx, rate as u128)?;
 
         payroll_member_state.set_inner(PayrollMember {
             payroll: ctx.accounts.payroll.key(),
             cvct_wallet: ctx.accounts.recipient_cvct_account.key(),
-            rate,
+            rate: encrypted_rate,
             last_paid: 0,
             active: true,
         });
@@ -464,24 +474,41 @@ pub mod cvct_payroll {
         Ok(())
     }
 
-    pub fn update_payroll_member(
-        ctx: Context<UpdatePayrollMember>,
+    /// Update payroll member with encrypted rate
+    pub fn update_payroll_member<'info>(
+        ctx: Context<'_, '_, '_, 'info, UpdatePayrollMember<'info>>,
         new_rate: u64,
         active: bool,
     ) -> Result<()> {
         let member = &mut ctx.accounts.payroll_member_state;
+        let inco = ctx.accounts.inco_lightning_program.to_account_info();
+        let signer = ctx.accounts.admin.to_account_info();
 
-        member.rate = new_rate;
+        // Convert new rate to encrypted value
+        let cpi_ctx = CpiContext::new(inco, Operation { signer });
+        let encrypted_rate = as_euint128(cpi_ctx, new_rate as u128)?;
+
+        member.rate = encrypted_rate;
         member.active = active;
 
         Ok(())
     }
 
-    pub fn run_payroll_for_member(ctx: Context<RunPayrollForMember>) -> Result<()> {
+    /// Run payroll for a member using encrypted operations
+    /// remaining_accounts:
+    ///   [0] treasury_allowance_account (mut)
+    ///   [1] treasury_owner_address (readonly)
+    ///   [2] member_allowance_account (mut)
+    ///   [3] member_owner_address (readonly)
+    pub fn run_payroll_for_member<'info>(
+        ctx: Context<'_, '_, '_, 'info, RunPayrollForMember<'info>>,
+    ) -> Result<()> {
         let payroll = &ctx.accounts.payroll;
         let member = &mut ctx.accounts.payroll_member_state;
         let org_treasury = &mut ctx.accounts.org_treasury;
         let member_cvct_account = &mut ctx.accounts.member_cvct_account;
+        let inco = ctx.accounts.inco_lightning_program.to_account_info();
+        let signer = ctx.accounts.payer.to_account_info();
 
         // 1. Check payroll is active
         require!(payroll.active, CvctError::PayrollNotActive);
@@ -493,7 +520,7 @@ pub mod cvct_payroll {
         let clock = Clock::get()?;
         let now = clock.unix_timestamp;
 
-        // 4. Calculate periods owed since last payment
+        // 4. Calculate periods owed since last payment (plaintext - timestamps are public)
         let time_elapsed = now - member.last_paid;
         let periods_owed = if member.last_paid == 0 {
             // First payment - pay one period
@@ -505,21 +532,99 @@ pub mod cvct_payroll {
         // 5. Check if payment is due
         require!(periods_owed > 0, CvctError::PayrollNotDue);
 
-        // 6. Calculate total owed
-        let amount_owed = member.rate * (periods_owed as u64);
-
-        // 7. Check treasury has sufficient funds
-        require!(
-            org_treasury.balance >= amount_owed,
-            CvctError::InsufficientFunds
+        // 6. Convert periods to encrypted value
+        let cpi_ctx = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
         );
+        let encrypted_periods = as_euint128(cpi_ctx, periods_owed as u128)?;
 
-        // 8. Transfer CVCT from treasury to member
-        org_treasury.balance -= amount_owed;
-        member_cvct_account.balance += amount_owed;
+        // 7. Calculate total owed: rate * periods (encrypted multiplication)
+        let cpi_ctx2 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let amount_owed = e_mul(cpi_ctx2, member.rate, encrypted_periods, 0u8)?;
 
-        // 9. Update last_paid to current time
+        // 8. Check if treasury has sufficient balance (encrypted comparison)
+        let cpi_ctx3 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let has_sufficient = e_ge(cpi_ctx3, org_treasury.balance, amount_owed, 0u8)?;
+
+        // 9. Conditionally set transfer amount (0 if insufficient)
+        let cpi_ctx4 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let zero_value = as_euint128(cpi_ctx4, 0)?;
+
+        let cpi_ctx5 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let transfer_amount = e_select(cpi_ctx5, has_sufficient, amount_owed, zero_value, 0u8)?;
+
+        // 10. Debit treasury using encrypted subtraction
+        let cpi_ctx6 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let new_treasury_balance = e_sub(cpi_ctx6, org_treasury.balance, transfer_amount, 0u8)?;
+        org_treasury.balance = new_treasury_balance;
+
+        // 11. Credit member using encrypted addition
+        let cpi_ctx7 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let new_member_balance =
+            e_add(cpi_ctx7, member_cvct_account.balance, transfer_amount, 0u8)?;
+        member_cvct_account.balance = new_member_balance;
+
+        // 12. Update last_paid to current time
         member.last_paid = now;
+
+        // 13. Grant allowance to treasury owner for their new balance
+        if ctx.remaining_accounts.len() >= 2 {
+            call_allow_from_remaining(
+                &inco,
+                &signer,
+                &ctx.accounts.system_program.to_account_info(),
+                ctx.remaining_accounts,
+                new_treasury_balance,
+                org_treasury.owner,
+                0,
+            )?;
+        }
+
+        // 14. Grant allowance to member owner for their new balance
+        if ctx.remaining_accounts.len() >= 4 {
+            call_allow_from_remaining(
+                &inco,
+                &signer,
+                &ctx.accounts.system_program.to_account_info(),
+                ctx.remaining_accounts,
+                new_member_balance,
+                member_cvct_account.owner,
+                2,
+            )?;
+        }
 
         Ok(())
     }
@@ -766,7 +871,6 @@ pub struct Organization {
 
 #[account]
 #[derive(InitSpace)]
-
 pub struct Payroll {
     pub org: Pubkey,
     pub interval: i64,
@@ -775,14 +879,16 @@ pub struct Payroll {
 }
 
 #[account]
-#[derive(InitSpace)]
-
 pub struct PayrollMember {
     pub payroll: Pubkey,
     pub cvct_wallet: Pubkey,
-    pub rate: u64, // CVCT per interval
+    pub rate: Euint128, // Encrypted CVCT per interval
     pub last_paid: i64,
     pub active: bool,
+}
+
+impl PayrollMember {
+    pub const LEN: usize = 32 + 32 + 32 + 8 + 1; // payroll + cvct_wallet + Euint128 + last_paid + active
 }
 
 #[derive(Accounts)]
@@ -860,7 +966,7 @@ pub struct AddPayrollMember<'info> {
     #[account(
         init,
         payer = admin,
-        space = 8 + PayrollMember::INIT_SPACE,
+        space = 8 + PayrollMember::LEN,
         seeds = [b"payroll_member", payroll.key().as_ref(), recipient.key().as_ref()],
         bump,
     )]
@@ -875,6 +981,9 @@ pub struct AddPayrollMember<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -892,7 +1001,12 @@ pub struct UpdatePayrollMember<'info> {
         constraint = payroll_member_state.payroll == payroll.key() @ CvctError::Unauthorized,
     )]
     pub payroll_member_state: Account<'info, PayrollMember>,
+    #[account(mut)]
     pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
