@@ -307,7 +307,6 @@ pub mod cvct_payroll {
     pub fn transfer_cvct<'info>(
         ctx: Context<'_, '_, '_, 'info, TransferCvct<'info>>,
         ciphertext: Vec<u8>,
-        input_type: u8,
     ) -> Result<()> {
         let from_cvct_account = &mut ctx.accounts.from_cvct_account;
         let to_cvct_account = &mut ctx.accounts.to_cvct_account;
@@ -319,14 +318,14 @@ pub mod cvct_payroll {
             return Ok(());
         }
 
-        // 1. Convert ciphertext to encrypted amount
+        // 1. Convert ciphertext to encrypted amount (0 = ciphertext input)
         let cpi_ctx = CpiContext::new(
             inco.clone(),
             Operation {
                 signer: signer.clone(),
             },
         );
-        let amount = new_euint128(cpi_ctx, ciphertext, input_type)?;
+        let amount = new_euint128(cpi_ctx, ciphertext, 0)?;
 
         // 2. Check if sender has sufficient balance (encrypted comparison)
         let cpi_ctx2 = CpiContext::new(
@@ -450,18 +449,19 @@ pub mod cvct_payroll {
         Ok(())
     }
 
-    /// Add a member to payroll with encrypted rate
+    /// Add a member to payroll with client-encrypted rate
+    /// Rate must be encrypted client-side using @inco/solana-sdk encryption
     pub fn add_payroll_member<'info>(
         ctx: Context<'_, '_, '_, 'info, AddPayrollMember<'info>>,
-        rate: u64,
+        rate_ciphertext: Vec<u8>,
     ) -> Result<()> {
         let payroll_member_state = &mut ctx.accounts.payroll_member_state;
         let inco = ctx.accounts.inco_lightning_program.to_account_info();
         let signer = ctx.accounts.admin.to_account_info();
 
-        // Convert rate to encrypted value
+        // Create encrypted handle from client-encrypted ciphertext (0 = ciphertext input)
         let cpi_ctx = CpiContext::new(inco, Operation { signer });
-        let encrypted_rate = as_euint128(cpi_ctx, rate as u128)?;
+        let encrypted_rate = new_euint128(cpi_ctx, rate_ciphertext, 0)?;
 
         payroll_member_state.set_inner(PayrollMember {
             payroll: ctx.accounts.payroll.key(),
@@ -474,19 +474,20 @@ pub mod cvct_payroll {
         Ok(())
     }
 
-    /// Update payroll member with encrypted rate
+    /// Update payroll member with client-encrypted rate
+    /// Rate must be encrypted client-side using @inco/solana-sdk encryption
     pub fn update_payroll_member<'info>(
         ctx: Context<'_, '_, '_, 'info, UpdatePayrollMember<'info>>,
-        new_rate: u64,
+        new_rate_ciphertext: Vec<u8>,
         active: bool,
     ) -> Result<()> {
         let member = &mut ctx.accounts.payroll_member_state;
         let inco = ctx.accounts.inco_lightning_program.to_account_info();
         let signer = ctx.accounts.admin.to_account_info();
 
-        // Convert new rate to encrypted value
+        // Create encrypted handle from client-encrypted ciphertext (0 = ciphertext input)
         let cpi_ctx = CpiContext::new(inco, Operation { signer });
-        let encrypted_rate = as_euint128(cpi_ctx, new_rate as u128)?;
+        let encrypted_rate = new_euint128(cpi_ctx, new_rate_ciphertext, 0)?;
 
         member.rate = encrypted_rate;
         member.active = active;
