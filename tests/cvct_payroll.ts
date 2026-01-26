@@ -53,7 +53,6 @@ interface TestContext {
 
 interface OrgContext extends TestContext {
   orgPda: PublicKey;
-  orgTreasuryPda: PublicKey;
   payrollPda: PublicKey;
 }
 
@@ -210,16 +209,6 @@ function deriveOrgPda(
 ): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [Buffer.from("org"), authority.toBuffer()],
-    programId
-  );
-}
-
-function deriveOrgTreasuryPda(
-  programId: PublicKey,
-  org: PublicKey
-): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("org_treasury"), org.toBuffer()],
     programId
   );
 }
@@ -449,43 +438,28 @@ async function transferCvct(
 // =============================================================================
 
 /**
- * Initialize organization with treasury
+ * Initialize organization with admin's CVCT account as treasury
  */
 async function initializeOrganization(
   program: anchor.Program<CvctPayroll>,
   admin: Keypair,
   cvctMint: PublicKey,
-  treasuryVault: PublicKey
-): Promise<{ orgPda: PublicKey; orgTreasuryPda: PublicKey }> {
+  treasury: PublicKey // Admin's CvctAccount
+): Promise<PublicKey> {
   const [orgPda] = deriveOrgPda(program.programId, admin.publicKey);
-  const [orgTreasuryPda] = deriveOrgTreasuryPda(program.programId, orgPda);
 
-  // Init org
   await program.methods
     .initOrg()
     .accounts({
       org: orgPda,
       cvctMint,
-      treasuryVault,
+      treasury,
       authority: admin.publicKey,
       systemProgram: SystemProgram.programId,
     } as any)
     .rpc();
 
-  // Init org treasury
-  await program.methods
-    .initOrgTreasury()
-    .accounts({
-      org: orgPda,
-      orgTreasury: orgTreasuryPda,
-      cvctMint,
-      admin: admin.publicKey,
-      systemProgram: SystemProgram.programId,
-      incoLightningProgram: INCO_LIGHTNING_PROGRAM_ID,
-    } as any)
-    .rpc();
-
-  return { orgPda, orgTreasuryPda };
+  return orgPda;
 }
 
 /**
@@ -604,12 +578,14 @@ describe("cvct-payroll", () => {
   
   // Organization PDAs
   let orgPda: PublicKey;
-  let orgTreasuryPda: PublicKey;
   let payrollPda: PublicKey;
   
-  // Admin's CVCT account (used as initial treasury vault reference)
+  // Admin's CVCT account (this IS the org treasury) and token account
   let adminCvctAccountPda: PublicKey;
   let adminTokenAccount: PublicKey;
+  
+  // Operator for running payroll
+  let operatorKeypair: Keypair;
   
   // Test members
   let member1: Keypair;
@@ -633,12 +609,14 @@ describe("cvct-payroll", () => {
     member1 = Keypair.generate();
     member2 = Keypair.generate();
     unauthorized = Keypair.generate();
+    operatorKeypair = Keypair.generate(); // Designated payroll operator
     
     // Airdrop to test accounts
     await Promise.all([
       airdrop(connection, member1.publicKey),
       airdrop(connection, member2.publicKey),
       airdrop(connection, unauthorized.publicKey),
+      airdrop(connection, operatorKeypair.publicKey),
     ]);
     
     // Create backing mint
@@ -705,6 +683,10 @@ describe("cvct-payroll", () => {
     console.log("Member1 CVCT account:", member1CvctAccountPda.toBase58());
     console.log("Member2 CVCT account:", member2CvctAccountPda.toBase58());
     
+    // Note: Admin's CVCT account (adminCvctAccountPda) will serve as the org treasury
+    // It already has CVCT tokens from the deposit above
+    console.log("Admin CVCT account will serve as org treasury");
+    
     console.log("\n=== Infrastructure setup complete ===\n");
   });
 
@@ -714,21 +696,24 @@ describe("cvct-payroll", () => {
   
   describe("init_org", () => {
     it("Should initialize organization successfully", async () => {
-      const result = await initializeOrganization(
+      // Admin's CVCT account serves as the org treasury
+      orgPda = await initializeOrganization(
         program,
         payer,
         cvctMintPda,
-        adminCvctAccountPda // Using admin's CVCT account as treasury vault
+        adminCvctAccountPda // Admin's own CVCT account is the treasury
       );
-      orgPda = result.orgPda;
-      orgTreasuryPda = result.orgTreasuryPda;
       
       const org = await program.account.organization.fetch(orgPda);
       expect(org.authority.toBase58()).to.equal(payer.publicKey.toBase58());
       expect(org.cvctMint.toBase58()).to.equal(cvctMintPda.toBase58());
+      // Verify the treasury is set to admin's CVCT account
+      expect(org.treasury.toBase58()).to.equal(adminCvctAccountPda.toBase58());
+      // Verify no operator initially
+      expect(org.operator).to.be.null;
       
       console.log("Organization initialized:", orgPda.toBase58());
-      console.log("Org Treasury:", orgTreasuryPda.toBase58());
+      console.log("Org Treasury (admin's account):", adminCvctAccountPda.toBase58());
     });
 
     it("Should fail to initialize org with non-existent CVCT mint", async () => {
@@ -742,7 +727,7 @@ describe("cvct-payroll", () => {
             .accounts({
               org: fakeOrgPda,
               cvctMint: fakeMint.publicKey,
-              treasuryVault: adminCvctAccountPda,
+              treasury: adminCvctAccountPda,
               authority: unauthorized.publicKey,
               systemProgram: SystemProgram.programId,
             } as any)
@@ -755,58 +740,71 @@ describe("cvct-payroll", () => {
   });
 
   // ==========================================================================
-  // INIT ORG TREASURY TESTS
+  // SET OPERATOR TESTS
   // ==========================================================================
   
-  describe("init_org_treasury", () => {
-    it("Should initialize org treasury successfully (done in init_org)", async () => {
-      // Already done in init_org test, verify state
-      const treasury = await program.account.cvctAccount.fetch(orgTreasuryPda);
-      expect(treasury.owner.toBase58()).to.equal(orgPda.toBase58());
-      expect(treasury.cvctMint.toBase58()).to.equal(cvctMintPda.toBase58());
-    });
-
-    it("Should fail to initialize treasury with unauthorized admin", async () => {
-      // Create a new org for this test to avoid conflicts
-      const newAdmin = Keypair.generate();
-      await airdrop(connection, newAdmin.publicKey);
-      
-      const newAdminCvctAccount = await initializeCvctAccount(program, cvctMintPda, newAdmin);
-      
-      const [newOrgPda] = deriveOrgPda(program.programId, newAdmin.publicKey);
-      const [newTreasuryPda] = deriveOrgTreasuryPda(program.programId, newOrgPda);
-      
-      // Initialize org first
+  describe("set_operator", () => {
+    it("Should set operator successfully", async () => {
       await program.methods
-        .initOrg()
+        .setOperator(operatorKeypair.publicKey)
         .accounts({
-          org: newOrgPda,
-          cvctMint: cvctMintPda,
-          treasuryVault: newAdminCvctAccount,
-          authority: newAdmin.publicKey,
-          systemProgram: SystemProgram.programId,
+          org: orgPda,
+          authority: payer.publicKey,
         } as any)
-        .signers([newAdmin])
         .rpc();
       
-      // Try to init treasury with wrong admin
+      const org = await program.account.organization.fetch(orgPda);
+      expect(org.operator).to.not.be.null;
+      expect(org.operator.toBase58()).to.equal(operatorKeypair.publicKey.toBase58());
+      
+      console.log("Operator set:", operatorKeypair.publicKey.toBase58());
+    });
+
+    it("Should fail to set operator with unauthorized signer", async () => {
       await expectError(
         async () => {
           await program.methods
-            .initOrgTreasury()
+            .setOperator(unauthorized.publicKey)
             .accounts({
-              org: newOrgPda,
-              orgTreasury: newTreasuryPda,
-              cvctMint: cvctMintPda,
-              admin: unauthorized.publicKey,
-              systemProgram: SystemProgram.programId,
-              incoLightningProgram: INCO_LIGHTNING_PROGRAM_ID,
+              org: orgPda,
+              authority: unauthorized.publicKey,
             } as any)
             .signers([unauthorized])
             .rpc();
         },
         "unauthorized"
       );
+    });
+
+    it("Should clear operator by passing null", async () => {
+      // First verify operator is set
+      let org = await program.account.organization.fetch(orgPda);
+      expect(org.operator).to.not.be.null;
+      
+      // Clear operator
+      await program.methods
+        .setOperator(null)
+        .accounts({
+          org: orgPda,
+          authority: payer.publicKey,
+        } as any)
+        .rpc();
+      
+      org = await program.account.organization.fetch(orgPda);
+      expect(org.operator).to.be.null;
+      
+      console.log("Operator cleared");
+      
+      // Re-set operator for subsequent tests
+      await program.methods
+        .setOperator(operatorKeypair.publicKey)
+        .accounts({
+          org: orgPda,
+          authority: payer.publicKey,
+        } as any)
+        .rpc();
+      
+      console.log("Operator re-set for subsequent tests");
     });
   });
 
@@ -1088,35 +1086,18 @@ describe("cvct-payroll", () => {
   // ==========================================================================
   
   describe("run_payroll_for_member", () => {
-    before(async () => {
-      // Fund the org treasury with CVCT for payroll
-      console.log("\nFunding org treasury for payroll tests...");
-      
-      // Transfer CVCT from admin to org treasury
-      await transferCvct(
-        program,
-        connection,
-        payer,
-        cvctMintPda,
-        adminCvctAccountPda,
-        orgTreasuryPda,
-        BigInt(50_000_000_000) // 50 tokens
-      );
-      
-      console.log("Org treasury funded");
-    });
+    // The org was initialized with adminCvctAccountPda as the treasury
+    // Admin's CVCT account has funds from the deposit in setup
+    // Only authority OR operator can run payroll
 
-    it("Should run payroll and pay member", async () => {
-      // Update the org's treasury vault reference to use orgTreasuryPda
-      // Note: This requires the org to point to the correct treasury
-      
+    it("Should run payroll by authority", async () => {
       await program.methods
         .runPayrollForMember()
         .accounts({
           org: orgPda,
           payroll: payrollPda,
           payrollMemberState: member1PayrollMemberPda,
-          orgTreasury: orgTreasuryPda,
+          orgTreasury: adminCvctAccountPda, // Admin's CVCT account is the treasury
           memberCvctAccount: member1CvctAccountPda,
           payer: payer.publicKey,
           systemProgram: SystemProgram.programId,
@@ -1127,7 +1108,29 @@ describe("cvct-payroll", () => {
       const member = await program.account.payrollMember.fetch(member1PayrollMemberPda);
       expect(member.lastPaid.toNumber()).to.be.greaterThan(0);
       
-      console.log("Payroll executed for member1");
+      console.log("Payroll executed by authority for member1");
+    });
+
+    it("Should fail to run payroll by unauthorized user", async () => {
+      await expectError(
+        async () => {
+          await program.methods
+            .runPayrollForMember()
+            .accounts({
+              org: orgPda,
+              payroll: payrollPda,
+              payrollMemberState: member1PayrollMemberPda,
+              orgTreasury: adminCvctAccountPda,
+              memberCvctAccount: member1CvctAccountPda,
+              payer: unauthorized.publicKey,
+              systemProgram: SystemProgram.programId,
+              incoLightningProgram: INCO_LIGHTNING_PROGRAM_ID,
+            } as any)
+            .signers([unauthorized])
+            .rpc();
+        },
+        "Unauthorized"
+      );
     });
 
     it("Should fail to run payroll when payroll is paused", async () => {
@@ -1149,7 +1152,7 @@ describe("cvct-payroll", () => {
               org: orgPda,
               payroll: payrollPda,
               payrollMemberState: member1PayrollMemberPda,
-              orgTreasury: orgTreasuryPda,
+              orgTreasury: adminCvctAccountPda,
               memberCvctAccount: member1CvctAccountPda,
               payer: payer.publicKey,
               systemProgram: SystemProgram.programId,
@@ -1194,7 +1197,7 @@ describe("cvct-payroll", () => {
               org: orgPda,
               payroll: payrollPda,
               payrollMemberState: member1PayrollMemberPda,
-              orgTreasury: orgTreasuryPda,
+              orgTreasury: adminCvctAccountPda,
               memberCvctAccount: member1CvctAccountPda,
               payer: payer.publicKey,
               systemProgram: SystemProgram.programId,
@@ -1229,7 +1232,7 @@ describe("cvct-payroll", () => {
               org: orgPda,
               payroll: payrollPda,
               payrollMemberState: member1PayrollMemberPda,
-              orgTreasury: orgTreasuryPda,
+              orgTreasury: adminCvctAccountPda,
               memberCvctAccount: member1CvctAccountPda,
               payer: payer.publicKey,
               systemProgram: SystemProgram.programId,
@@ -1263,7 +1266,7 @@ describe("cvct-payroll", () => {
         .accounts({
           org: tempOrgPda,
           cvctMint: cvctMintPda,
-          treasuryVault: tempCvctAccount,
+          treasury: tempCvctAccount,
           authority: tempAdmin.publicKey,
           systemProgram: SystemProgram.programId,
         } as any)
@@ -1371,8 +1374,10 @@ describe("cvct-payroll", () => {
       
       const org = await program.account.organization.fetch(orgPda);
       console.log("Organization Authority:", org.authority.toBase58());
+      console.log("Organization Operator:", org.operator ? org.operator.toBase58() : "None");
       
-      const treasury = await program.account.cvctAccount.fetch(orgTreasuryPda);
+      // Admin's CVCT account is the treasury
+      const treasury = await program.account.cvctAccount.fetch(adminCvctAccountPda);
       const treasuryHandle = extractHandle(treasury.balance);
       console.log("Treasury Balance Handle:", treasuryHandle.toString());
       

@@ -412,27 +412,17 @@ pub mod cvct_payroll {
         org.set_inner(Organization {
             authority: ctx.accounts.authority.key(),
             cvct_mint: ctx.accounts.cvct_mint.key(),
-            cvct_treasury_vault: ctx.accounts.treasury_vault.key(),
+            treasury: ctx.accounts.treasury.key(),
+            operator: None, // No operator initially
         });
 
         Ok(())
     }
 
-    pub fn init_org_treasury(ctx: Context<InitOrgTreasury>) -> Result<()> {
-        let org_treasury = &mut ctx.accounts.org_treasury;
-        let inco = ctx.accounts.inco_lightning_program.to_account_info();
-        let signer = ctx.accounts.admin.to_account_info();
-
-        // Initialize encrypted zero balance
-        let cpi_ctx = CpiContext::new(inco, Operation { signer });
-        let zero_balance = as_euint128(cpi_ctx, 0)?;
-
-        org_treasury.set_inner(CvctAccount {
-            owner: ctx.accounts.org.key(),
-            cvct_mint: ctx.accounts.cvct_mint.key(),
-            balance: zero_balance,
-        });
-
+    /// Set or clear the designated operator who can run payroll
+    /// Pass None to remove the operator
+    pub fn set_operator(ctx: Context<SetOperator>, operator: Option<Pubkey>) -> Result<()> {
+        ctx.accounts.org.operator = operator;
         Ok(())
     }
 
@@ -496,6 +486,7 @@ pub mod cvct_payroll {
     }
 
     /// Run payroll for a member using encrypted operations
+    /// Only the org authority or designated operator can call this
     /// remaining_accounts:
     ///   [0] treasury_allowance_account (mut)
     ///   [1] treasury_owner_address (readonly)
@@ -504,12 +495,19 @@ pub mod cvct_payroll {
     pub fn run_payroll_for_member<'info>(
         ctx: Context<'_, '_, '_, 'info, RunPayrollForMember<'info>>,
     ) -> Result<()> {
+        let org = &ctx.accounts.org;
         let payroll = &ctx.accounts.payroll;
         let member = &mut ctx.accounts.payroll_member_state;
         let org_treasury = &mut ctx.accounts.org_treasury;
         let member_cvct_account = &mut ctx.accounts.member_cvct_account;
         let inco = ctx.accounts.inco_lightning_program.to_account_info();
         let signer = ctx.accounts.payer.to_account_info();
+        let payer_key = ctx.accounts.payer.key();
+
+        // 0. Check caller is authority OR operator
+        let is_authority = org.authority == payer_key;
+        let is_operator = org.operator.map_or(false, |op| op == payer_key);
+        require!(is_authority || is_operator, CvctError::Unauthorized);
 
         // 1. Check payroll is active
         require!(payroll.active, CvctError::PayrollNotActive);
@@ -863,11 +861,16 @@ pub struct TransferCvct<'info> {
 // ============================================
 
 #[account]
-#[derive(InitSpace)]
 pub struct Organization {
     pub authority: Pubkey,
     pub cvct_mint: Pubkey,
-    pub cvct_treasury_vault: Pubkey,
+    pub treasury: Pubkey,            // Admin's CvctAccount (their regular account)
+    pub operator: Option<Pubkey>,    // Designated payroll operator (can run payroll)
+}
+
+impl Organization {
+    // 32 (authority) + 32 (cvct_mint) + 32 (treasury) + 1 + 32 (Option<Pubkey>)
+    pub const LEN: usize = 32 + 32 + 32 + 1 + 32;
 }
 
 #[account]
@@ -897,42 +900,31 @@ pub struct InitOrg<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + Organization::INIT_SPACE,
+        space = 8 + Organization::LEN,
         seeds = [b"org", authority.key().as_ref()],
         bump,
     )]
     pub org: Account<'info, Organization>,
     pub cvct_mint: Account<'info, CvctMint>,
-    pub treasury_vault: Account<'info, CvctAccount>,
+    /// The admin's CvctAccount that will serve as the org treasury
+    #[account(
+        constraint = treasury.cvct_mint == cvct_mint.key() @ CvctError::InvalidVault,
+        constraint = treasury.owner == authority.key() @ CvctError::Unauthorized,
+    )]
+    pub treasury: Account<'info, CvctAccount>,
     #[account(mut)]
     pub authority: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct InitOrgTreasury<'info> {
+pub struct SetOperator<'info> {
     #[account(
-        constraint = org.authority == admin.key() @ CvctError::Unauthorized,
+        mut,
+        constraint = org.authority == authority.key() @ CvctError::Unauthorized,
     )]
     pub org: Account<'info, Organization>,
-    #[account(
-        init,
-        payer = admin,
-        space = 8 + CvctAccount::LEN,
-        seeds = [b"org_treasury", org.key().as_ref()],
-        bump,
-    )]
-    pub org_treasury: Account<'info, CvctAccount>,
-    #[account(
-        constraint = cvct_mint.key() == org.cvct_mint @ CvctError::InvalidVault,
-    )]
-    pub cvct_mint: Account<'info, CvctMint>,
-    #[account(mut)]
-    pub admin: Signer<'info>,
-    pub system_program: Program<'info, System>,
-    /// CHECK: Inco Lightning program
-    #[account(address = INCO_LIGHTNING_ID)]
-    pub inco_lightning_program: AccountInfo<'info>,
+    pub authority: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -1024,7 +1016,7 @@ pub struct RunPayrollForMember<'info> {
     pub payroll_member_state: Account<'info, PayrollMember>,
     #[account(
         mut,
-        constraint = org_treasury.key() == org.cvct_treasury_vault @ CvctError::InvalidVault,
+        constraint = org_treasury.key() == org.treasury @ CvctError::InvalidVault,
     )]
     pub org_treasury: Account<'info, CvctAccount>,
     #[account(
