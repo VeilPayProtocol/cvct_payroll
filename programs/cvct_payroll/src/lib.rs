@@ -421,11 +421,17 @@ pub mod cvct_payroll {
 
     pub fn init_org_treasury(ctx: Context<InitOrgTreasury>) -> Result<()> {
         let org_treasury = &mut ctx.accounts.org_treasury;
+        let inco = ctx.accounts.inco_lightning_program.to_account_info();
+        let signer = ctx.accounts.admin.to_account_info();
+
+        // Initialize encrypted zero balance
+        let cpi_ctx = CpiContext::new(inco, Operation { signer });
+        let zero_balance = as_euint128(cpi_ctx, 0)?;
 
         org_treasury.set_inner(CvctAccount {
             owner: ctx.accounts.org.key(),
             cvct_mint: ctx.accounts.cvct_mint.key(),
-            balance: 0,
+            balance: zero_balance,
         });
 
         Ok(())
@@ -817,6 +823,9 @@ pub struct InitOrgTreasury<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -908,6 +917,12 @@ pub struct RunPayrollForMember<'info> {
         constraint = member_cvct_account.key() == payroll_member_state.cvct_wallet @ CvctError::Unauthorized,
     )]
     pub member_cvct_account: Account<'info, CvctAccount>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
