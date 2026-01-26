@@ -136,7 +136,12 @@ async function airdrop(
   amount: number = 2 * LAMPORTS_PER_SOL
 ): Promise<void> {
   const sig = await connection.requestAirdrop(to, amount);
-  await connection.confirmTransaction(sig, "confirmed");
+  const latestBlockhash = await connection.getLatestBlockhash();
+  await connection.confirmTransaction({
+    signature: sig,
+    blockhash: latestBlockhash.blockhash,
+    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+  });
 }
 
 // =============================================================================

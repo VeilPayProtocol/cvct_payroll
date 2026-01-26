@@ -875,8 +875,8 @@ pub struct TransferCvct<'info> {
 pub struct Organization {
     pub authority: Pubkey,
     pub cvct_mint: Pubkey,
-    pub treasury: Pubkey,            // Admin's CvctAccount (their regular account)
-    pub operator: Option<Pubkey>,    // Designated payroll operator (can run payroll)
+    pub treasury: Pubkey,         // Admin's CvctAccount (their regular account)
+    pub operator: Option<Pubkey>, // Designated payroll operator (can run payroll)
 }
 
 impl Organization {
