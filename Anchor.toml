@@ -8,6 +8,9 @@ skip-lint = false
 [programs.localnet]
 cvct_payroll = "Sd92uPUtbHdnoRFmi6xCEsLVh4Yg3KYcNbGXeSJVL5R"
 
+[programs.devnet]
+inco_lightning = "5sjEbPiqgZrYwR31ahR6Uk9wf5awoX61YGg7jExQSwaj"
+
 [registry]
 url = "https://api.apr.dev"
 

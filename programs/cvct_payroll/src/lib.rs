@@ -3,8 +3,45 @@ use anchor_spl::{
     associated_token::AssociatedToken,
     token::{transfer, Mint, Token, TokenAccount, Transfer},
 };
+use inco_lightning::cpi::accounts::{Allow, Operation};
+use inco_lightning::cpi::{allow, as_euint128, e_add, e_ge, e_select, e_sub, new_euint128};
+use inco_lightning::types::{Ebool, Euint128};
+use inco_lightning::ID as INCO_LIGHTNING_ID;
 
 declare_id!("Sd92uPUtbHdnoRFmi6xCEsLVh4Yg3KYcNbGXeSJVL5R");
+
+/// Helper to call allow with accounts from remaining_accounts
+/// remaining_accounts[offset] = allowance_account (mut)
+/// remaining_accounts[offset+1] = allowed_address (readonly)
+fn call_allow_from_remaining<'info>(
+    inco_program: &AccountInfo<'info>,
+    signer: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    remaining_accounts: &[AccountInfo<'info>],
+    handle: Euint128,
+    allowed_pubkey: Pubkey,
+    account_offset: usize,
+) -> Result<()> {
+    if remaining_accounts.len() < account_offset + 2 {
+        return Err(CvctError::InvalidAllowanceAccounts.into());
+    }
+
+    let allowance_account = &remaining_accounts[account_offset];
+    let allowed_address = &remaining_accounts[account_offset + 1];
+
+    let cpi_ctx = CpiContext::new(
+        inco_program.clone(),
+        Allow {
+            allowance_account: allowance_account.clone(),
+            signer: signer.clone(),
+            allowed_address: allowed_address.clone(),
+            system_program: system_program.clone(),
+        },
+    );
+
+    allow(cpi_ctx, handle.0, true, allowed_pubkey)?;
+    Ok(())
+}
 
 #[program]
 pub mod cvct_payroll {
@@ -17,35 +54,67 @@ pub mod cvct_payroll {
     pub fn initialize_cvct_mint(ctx: Context<InitializeCvctMint>) -> Result<()> {
         let cvct_mint = &mut ctx.accounts.cvct_mint;
         let vault = &mut ctx.accounts.vault;
+        let inco = ctx.accounts.inco_lightning_program.to_account_info();
+        let signer = ctx.accounts.authority.to_account_info();
 
-        cvct_mint.authority = ctx.accounts.authority.key();
-        cvct_mint.backing_mint = ctx.accounts.backing_mint.key();
-        cvct_mint.total_supply = 0;
+        // Initialize encrypted zero for total_supply
+        let cpi_ctx = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let zero_supply = as_euint128(cpi_ctx, 0)?;
 
-        vault.cvct_mint = cvct_mint.key();
-        vault.backing_mint = ctx.accounts.backing_mint.key();
-        vault.backing_token_account = ctx.accounts.vault_token_account.key();
-        vault.total_locked = 0;
+        // Initialize encrypted zero for vault's total_locked
+        let cpi_ctx2 = CpiContext::new(inco, Operation { signer });
+        let zero_locked = as_euint128(cpi_ctx2, 0)?;
+
+        cvct_mint.set_inner(CvctMint {
+            authority: ctx.accounts.authority.key(),
+            backing_mint: ctx.accounts.backing_mint.key(),
+            total_supply: zero_supply,
+            decimals: ctx.accounts.backing_mint.decimals,
+        });
+
+        vault.set_inner(Vault {
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            backing_mint: ctx.accounts.backing_mint.key(),
+            backing_token_account: ctx.accounts.vault_token_account.key(),
+            total_locked: zero_locked,
+        });
 
         Ok(())
     }
 
     pub fn initialize_cvct_account(ctx: Context<InitializeCvctAccount>) -> Result<()> {
         let cvct_account = &mut ctx.accounts.cvct_account;
+        let inco = ctx.accounts.inco_lightning_program.to_account_info();
+        let signer = ctx.accounts.owner.to_account_info();
 
-        cvct_account.owner = ctx.accounts.owner.key();
-        cvct_account.cvct_mint = ctx.accounts.cvct_mint.key();
-        cvct_account.balance = 0;
+        // Initialize encrypted zero balance
+        let cpi_ctx = CpiContext::new(inco, Operation { signer });
+        let zero_balance = as_euint128(cpi_ctx, 0)?;
+
+        cvct_account.set_inner(CvctAccount {
+            owner: ctx.accounts.owner.key(),
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            balance: zero_balance,
+        });
 
         Ok(())
     }
 
+    /// Deposit backing tokens and mint encrypted CVCT
+    /// remaining_accounts: [allowance_account, owner_address] for granting balance access
     pub fn deposit_and_mint(ctx: Context<DepositAndMint>, amount: u64) -> Result<()> {
         let cvct_mint = &mut ctx.accounts.cvct_mint;
         let vault = &mut ctx.accounts.vault;
         let cvct_account = &mut ctx.accounts.cvct_account;
+        let inco = &mut ctx.accounts.inco_lightning_program.to_account_info();
+        let signer = &mut ctx.accounts.user.to_account_info();
 
-        // 1. Transfer backing asset from user to vault
+        // 1. Transfer backing asset from user to vault (SPL Token transfer)
         transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -58,16 +127,55 @@ pub mod cvct_payroll {
             amount,
         )?;
 
-        // 2. Mint CVCT (update balances)
-        cvct_account.balance += amount;
-        cvct_mint.total_supply += amount;
-        vault.total_locked += amount;
-
-        // 3. Enforce invariant
-        require!(
-            cvct_mint.total_supply == vault.total_locked,
-            CvctError::InvariantViolation
+        // 2. Convert plaintext amount to encrypted value
+        let cpi_ctx = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
         );
+        let encrypted_amount = as_euint128(cpi_ctx, amount as u128)?;
+
+        // 3. Update encrypted balances using encrypted addition
+        let cpi_ctx2 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let new_balance = e_add(cpi_ctx2, cvct_account.balance, encrypted_amount, 0u8)?;
+        cvct_account.balance = new_balance;
+
+        let cpi_ctx3 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let new_supply = e_add(cpi_ctx3, cvct_mint.total_supply, encrypted_amount, 0u8)?;
+        cvct_mint.total_supply = new_supply;
+
+        let cpi_ctx4 = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
+        let new_locked = e_add(cpi_ctx4, vault.total_locked, encrypted_amount, 0u8)?;
+        vault.total_locked = new_locked;
+
+        // 4. Grant allowance to owner for their new balance
+        if ctx.remaining_accounts.len() >= 2 {
+            call_allow_from_remaining(
+                &inco,
+                &signer,
+                &ctx.accounts.system_program.to_account_info(),
+                ctx.remaining_accounts,
+                new_balance,
+                cvct_account.owner,
+                0,
+            )?;
+        }
 
         Ok(())
     }
@@ -270,55 +378,67 @@ pub mod cvct_payroll {
     }
 }
 
-#[error_code]
-pub enum ErrorCode {
-    #[msg("The computation was aborted")]
-    AbortedComputation,
-    #[msg("Cluster not set")]
-    ClusterNotSet,
-}
-
 // ============================================
 //                   CVCT
 // ============================================
 
 #[account]
-#[derive(InitSpace)]
 pub struct CvctMint {
     pub authority: Pubkey,
     pub backing_mint: Pubkey,
-    pub total_supply: u64,
+    pub total_supply: Euint128, // Encrypted total supply
     pub decimals: u8,
 }
 
-#[account]
-#[derive(InitSpace)]
-pub struct CvctAccount {
-    pub owner: Pubkey,
-    pub cvct_mint: Pubkey,
-    pub balance: u64,
+impl CvctMint {
+    pub const LEN: usize = 32 + 32 + 32 + 1; // authority + backing_mint + Euint128 + decimals
 }
 
 #[account]
-#[derive(InitSpace)]
+pub struct CvctAccount {
+    pub owner: Pubkey,
+    pub cvct_mint: Pubkey,
+    pub balance: Euint128, // Encrypted balance
+}
+
+impl CvctAccount {
+    pub const LEN: usize = 32 + 32 + 32; // owner + cvct_mint + Euint128
+}
+
+#[account]
 pub struct Vault {
     pub cvct_mint: Pubkey,
     pub backing_mint: Pubkey,
     pub backing_token_account: Pubkey,
-    pub total_locked: u64,
+    pub total_locked: Euint128, // Encrypted total locked
+}
+
+impl Vault {
+    pub const LEN: usize = 32 + 32 + 32 + 32; // cvct_mint + backing_mint + backing_token_account + Euint128
 }
 
 #[error_code]
 pub enum CvctError {
+    #[msg("Insufficient funds for operation")]
     InsufficientFunds,
+    #[msg("Invariant violation detected")]
     InvariantViolation,
+    #[msg("Invalid vault")]
     InvalidVault,
+    #[msg("Unauthorized operation")]
     Unauthorized,
+    #[msg("Amount must be greater than zero")]
     ZeroAmount,
+    #[msg("Payroll member is not active")]
     MemberNotActive,
+    #[msg("Payroll is not active")]
     PayrollNotActive,
+    #[msg("Payroll payment not due yet")]
     PayrollNotDue,
+    #[msg("Payroll must be paused first")]
     MustPauseFirst,
+    #[msg("Invalid allowance accounts provided")]
+    InvalidAllowanceAccounts,
 }
 
 #[derive(Accounts)]
@@ -326,7 +446,7 @@ pub struct InitializeCvctMint<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + CvctMint::INIT_SPACE,
+        space = 8 + CvctMint::LEN,
         seeds = [b"cvct_mint", authority.key().as_ref()],
         bump,
     )]
@@ -334,7 +454,7 @@ pub struct InitializeCvctMint<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + Vault::INIT_SPACE,
+        space = 8 + Vault::LEN,
         seeds = [b"vault", authority.key().as_ref()],
         bump,
     )]
@@ -352,6 +472,9 @@ pub struct InitializeCvctMint<'info> {
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -359,7 +482,7 @@ pub struct InitializeCvctAccount<'info> {
     #[account(
         init,
         payer = owner,
-        space = 8 + CvctAccount::INIT_SPACE,
+        space = 8 + CvctAccount::LEN,
         seeds = [b"cvct_account", cvct_mint.key().as_ref(), owner.key().as_ref()],
         bump,
     )]
@@ -368,6 +491,9 @@ pub struct InitializeCvctAccount<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
     pub system_program: Program<'info, System>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -399,6 +525,10 @@ pub struct DepositAndMint<'info> {
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -432,6 +562,10 @@ pub struct BurnAndWithdraw<'info> {
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -448,7 +582,12 @@ pub struct TransferCvct<'info> {
         constraint = to_cvct_account.cvct_mint == cvct_mint.key(),
     )]
     pub to_cvct_account: Account<'info, CvctAccount>,
+    #[account(mut)]
     pub from: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: Inco Lightning program
+    #[account(address = INCO_LIGHTNING_ID)]
+    pub inco_lightning_program: AccountInfo<'info>,
 }
 
 // ============================================
@@ -658,10 +797,3 @@ pub struct ClosePayroll<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
 }
-
-/*
-require_keys_eq!(org.authority, signer.key());
-require_keys_eq!(org.cvct_mint, cvct_mint.key());
-require_keys_eq!(org.cvct_treasury_vault, treasury_vault.key());
-
-*/
