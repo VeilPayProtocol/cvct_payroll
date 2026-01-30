@@ -87,13 +87,22 @@ pub mod cvct_payroll {
         Ok(())
     }
 
-    pub fn initialize_cvct_account(ctx: Context<InitializeCvctAccount>) -> Result<()> {
+    /// Initialize a CVCT account with encrypted zero balance
+    /// remaining_accounts: [allowance_account, owner_address] for granting balance access
+    pub fn initialize_cvct_account<'info>(
+        ctx: Context<'_, '_, '_, 'info, InitializeCvctAccount<'info>>,
+    ) -> Result<()> {
         let cvct_account = &mut ctx.accounts.cvct_account;
         let inco = ctx.accounts.inco_lightning_program.to_account_info();
         let signer = ctx.accounts.owner.to_account_info();
 
         // Initialize encrypted zero balance
-        let cpi_ctx = CpiContext::new(inco, Operation { signer });
+        let cpi_ctx = CpiContext::new(
+            inco.clone(),
+            Operation {
+                signer: signer.clone(),
+            },
+        );
         let zero_balance = as_euint128(cpi_ctx, 0)?;
 
         cvct_account.set_inner(CvctAccount {
@@ -101,6 +110,19 @@ pub mod cvct_payroll {
             cvct_mint: ctx.accounts.cvct_mint.key(),
             balance: zero_balance,
         });
+
+        // Grant allowance to owner for their initial balance
+        if ctx.remaining_accounts.len() >= 2 {
+            call_allow_from_remaining(
+                &inco,
+                &signer,
+                &ctx.accounts.system_program.to_account_info(),
+                ctx.remaining_accounts,
+                zero_balance,
+                cvct_account.owner,
+                0,
+            )?;
+        }
 
         Ok(())
     }
