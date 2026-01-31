@@ -9,13 +9,14 @@ skip-lint = false
 cvct_payroll = "Sd92uPUtbHdnoRFmi6xCEsLVh4Yg3KYcNbGXeSJVL5R"
 
 [programs.devnet]
+cvct_payroll = "Sd92uPUtbHdnoRFmi6xCEsLVh4Yg3KYcNbGXeSJVL5R"
 inco_lightning = "5sjEbPiqgZrYwR31ahR6Uk9wf5awoX61YGg7jExQSwaj"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
+cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
@@ -23,3 +24,6 @@ test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
 
 [test]
 startup_wait = 100000
+
+[deploy]
+task_token = "target/deploy/cvct_payroll-keypair.json"
