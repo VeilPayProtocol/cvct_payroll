@@ -10,6 +10,7 @@ const COMP_DEF_OFFSET_INIT_MINT_STATE: u32 = comp_def_offset("init_mint_state");
 const COMP_DEF_OFFSET_INIT_ACCOUNT_STATE: u32 = comp_def_offset("init_account_state");
 const COMP_DEF_OFFSET_DEPOSIT_AND_MINT: u32 = comp_def_offset("deposit_and_mint");
 const COMP_DEF_OFFSET_BURN_AND_WITHDRAW: u32 = comp_def_offset("burn_and_withdraw");
+const COMP_DEF_OFFSET_TRANSFER_CVCT: u32 = comp_def_offset("transfer_cvct");
 const ENCRYPTED_U128_CIPHERTEXTS: usize = 1;
 
 declare_id!("B4rLKdnQsFH2e4CBefgWsBXZ7xsX4ewb7QUiMim4Nbvj");
@@ -40,6 +41,12 @@ pub mod cvct {
         ctx: Context<InitBurnAndWithdrawCompDef>,
     ) -> Result<()> {
         // Registers the confidential circuit interface for withdrawals.
+        init_comp_def(ctx.accounts, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_transfer_cvct_comp_def(ctx: Context<InitTransferCvctCompDef>) -> Result<()> {
+        // Registers the confidential circuit interface for transfers.
         init_comp_def(ctx.accounts, None, None)?;
         Ok(())
     }
@@ -512,6 +519,106 @@ pub mod cvct {
                 amount_u64,
             )?;
         }
+
+        Ok(())
+    }
+
+    pub fn transfer_cvct(
+        ctx: Context<TransferCvct>,
+        computation_offset: u64,
+        amount: u64,
+        from_enc_pubkey: [u8; 32],
+        from_balance_nonce: u128,
+        from_new_balance_nonce: u128,
+        to_enc_pubkey: [u8; 32],
+        to_balance_nonce: u128,
+        to_new_balance_nonce: u128,
+    ) -> Result<()> {
+        require!(amount > 0, ErrorCode::ZeroAmount);
+
+        let args = ArgBuilder::new()
+            // Sender balance.
+            .x25519_pubkey(from_enc_pubkey)
+            .plaintext_u128(from_balance_nonce)
+            .account(
+                ctx.accounts.from_cvct_account.key(),
+                8 + 32 + 32 + 32,
+                (32 * ENCRYPTED_U128_CIPHERTEXTS) as u32,
+            )
+            // Plaintext transfer amount.
+            .plaintext_u128(amount as u128)
+            // Output context for sender.
+            .x25519_pubkey(from_enc_pubkey)
+            .plaintext_u128(from_new_balance_nonce)
+            // Recipient balance.
+            .x25519_pubkey(to_enc_pubkey)
+            .plaintext_u128(to_balance_nonce)
+            .account(
+                ctx.accounts.to_cvct_account.key(),
+                8 + 32 + 32 + 32,
+                (32 * ENCRYPTED_U128_CIPHERTEXTS) as u32,
+            )
+            // Output context for recipient.
+            .x25519_pubkey(to_enc_pubkey)
+            .plaintext_u128(to_new_balance_nonce)
+            .build();
+
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![TransferCvctCallback::callback_ix(
+                computation_offset,
+                &ctx.accounts.mxe_account,
+                &[
+                    CallbackAccount {
+                        pubkey: ctx.accounts.from_cvct_account.key(),
+                        is_writable: true,
+                    },
+                    CallbackAccount {
+                        pubkey: ctx.accounts.to_cvct_account.key(),
+                        is_writable: true,
+                    },
+                ],
+            )?],
+            1,
+            0,
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "transfer_cvct")]
+    pub fn transfer_cvct_callback(
+        ctx: Context<TransferCvctCallback>,
+        output: SignedComputationOutputs<TransferCvctOutput>,
+    ) -> Result<()> {
+        let (from_balance, to_balance, _ok) = match output.verify_output(
+            &ctx.accounts.cluster_account,
+            &ctx.accounts.computation_account,
+        ) {
+            Ok(TransferCvctOutput {
+                field_0:
+                    TransferCvctOutputStruct0 {
+                        field_0: from_balance,
+                        field_1: to_balance,
+                        field_2: ok,
+                    },
+            }) => (from_balance, to_balance, ok),
+            Err(_) => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        let from_cvct_account = &mut ctx.accounts.from_cvct_account;
+        let to_cvct_account = &mut ctx.accounts.to_cvct_account;
+
+        from_cvct_account.balance = from_balance.ciphertexts;
+        from_cvct_account.balance_nonce = from_balance.nonce;
+
+        to_cvct_account.balance = to_balance.ciphertexts;
+        to_cvct_account.balance_nonce = to_balance.nonce;
 
         Ok(())
     }
@@ -1015,6 +1122,100 @@ pub struct BurnAndWithdrawCallback<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[queue_computation_accounts("transfer_cvct", user)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct TransferCvct<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(
+        init_if_needed,
+        space = 9,
+        payer = user,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    /// Arcium signer PDA used to sign the queued computation.
+    pub sign_pda_account: Box<Account<'info, ArciumSignerAccount>>,
+    #[account(address = derive_mxe_pda!())]
+    /// MXE account identifies the Arcium execution environment.
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(
+        mut,
+        address = derive_mempool_pda!(mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// CHECK: mempool_account, checked by the arcium program.
+    pub mempool_account: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        address = derive_execpool_pda!(mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// CHECK: executing_pool, checked by the arcium program.
+    pub executing_pool: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        address = derive_comp_pda!(computation_offset, mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_TRANSFER_CVCT))]
+    /// On-chain computation definition for `transfer_cvct`.
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(
+        mut,
+        address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// Cluster state used for output verification.
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    /// Fee pool used by Arcium.
+    pub pool_account: Box<Account<'info, FeePool>>,
+    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    /// Arcium clock account.
+    pub clock_account: Box<Account<'info, ClockAccount>>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(
+        mut,
+        constraint = from_cvct_account.owner == user.key() @ ErrorCode::Unauthorized,
+    )]
+    pub from_cvct_account: Box<Account<'info, CvctAccount>>,
+    #[account(
+        mut,
+        constraint = to_cvct_account.cvct_mint == from_cvct_account.cvct_mint,
+    )]
+    pub to_cvct_account: Box<Account<'info, CvctAccount>>,
+}
+
+#[callback_accounts("transfer_cvct")]
+#[derive(Accounts)]
+pub struct TransferCvctCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_TRANSFER_CVCT))]
+    /// Same computation definition as queued instruction.
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(address = derive_mxe_pda!())]
+    /// MXE account for this computation.
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: computation_account, checked by arcium program via constraints in the callback context.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(
+        address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// Cluster account used to verify Arcium output signature.
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    /// CHECK: instructions_sysvar, checked by the account constraint
+    pub instructions_sysvar: AccountInfo<'info>,
+    #[account(mut)]
+    /// Sender CVCT account to update encrypted balance.
+    pub from_cvct_account: Box<Account<'info, CvctAccount>>,
+    #[account(mut)]
+    /// Recipient CVCT account to update encrypted balance.
+    pub to_cvct_account: Box<Account<'info, CvctAccount>>,
+}
+
 #[init_computation_definition_accounts("init_mint_state", payer)]
 #[derive(Accounts)]
 pub struct InitMintStateCompDef<'info> {
@@ -1066,6 +1267,22 @@ pub struct InitDepositAndMintCompDef<'info> {
 #[init_computation_definition_accounts("burn_and_withdraw", payer)]
 #[derive(Accounts)]
 pub struct InitBurnAndWithdrawCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    /// MXE account required to initialize comp def.
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut)]
+    /// CHECK: comp_def_account, checked by arcium program.
+    /// Can't check it here as it's not initialized yet.
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("transfer_cvct", payer)]
+#[derive(Accounts)]
+pub struct InitTransferCvctCompDef<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]

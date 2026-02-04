@@ -37,6 +37,7 @@ const COMP_DEF_MINT = "init_mint_state";
 const COMP_DEF_ACCOUNT = "init_account_state";
 const COMP_DEF_DEPOSIT = "deposit_and_mint";
 const COMP_DEF_BURN = "burn_and_withdraw";
+const COMP_DEF_TRANSFER = "transfer_cvct";
 
 // Helper: produce a random 128-bit nonce as both bytes and BN.
 function randomNonce(): { bytes: Uint8Array; bn: anchor.BN } {
@@ -118,6 +119,10 @@ describe("Cvct", () => {
     console.log("Initializing burn_and_withdraw comp def");
     await initBurnAndWithdrawCompDef(program, payer);
     console.log("Burn comp def initialized");
+
+    console.log("Initializing transfer_cvct comp def");
+    await initTransferCvctCompDef(program, payer);
+    console.log("Transfer comp def initialized");
 
     // Backing SPL mint the CVCT mint will wrap.
     const backingMint = await createMint(
@@ -301,6 +306,74 @@ describe("Cvct", () => {
       "confirmed",
     );
 
+    // Create a recipient CVCT account for transfers.
+    const recipient = anchor.web3.Keypair.generate();
+    await transferLamports(
+      provider.connection,
+      payer.payer,
+      recipient.publicKey,
+      2 * anchor.web3.LAMPORTS_PER_SOL,
+    );
+
+    const [recipientCvctAccountPda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("cvct_account"),
+        cvctMintPda.toBuffer(),
+        recipient.publicKey.toBuffer(),
+      ],
+      program.programId,
+    );
+
+    const recipientComputationOffset = new anchor.BN(randomBytes(8));
+    const recipientEncKey = x25519.utils.randomSecretKey();
+    const recipientEncPubkey = x25519.getPublicKey(recipientEncKey);
+    const recipientNonce = randomNonce();
+    const recipientCompDefOffset = getCompDefAccOffset(COMP_DEF_ACCOUNT);
+
+    console.log("Queuing init_account_state computation for recipient");
+    await rpcWithLogs(
+      program.methods
+        .initializeCvctAccount(
+          recipientComputationOffset,
+          Array.from(recipientEncPubkey),
+          recipientNonce.bn,
+        )
+        .accountsPartial({
+          owner: recipient.publicKey,
+          cvctAccount: recipientCvctAccountPda,
+          cvctMint: cvctMintPda,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          mxeAccount: getMXEAccAddress(program.programId),
+          mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
+          executingPool: getExecutingPoolAccAddress(
+            arciumEnv.arciumClusterOffset,
+          ),
+          computationAccount: getComputationAccAddress(
+            arciumEnv.arciumClusterOffset,
+            recipientComputationOffset,
+          ),
+          compDefAccount: getCompDefAccAddress(
+            program.programId,
+            Buffer.from(recipientCompDefOffset).readUInt32LE(),
+          ),
+          clusterAccount: getClusterAccAddress(arciumEnv.arciumClusterOffset),
+          poolAccount,
+          clockAccount,
+          arciumProgram: arciumProgramId,
+        })
+        .signers([recipient])
+        .rpc({ skipPreflight: true, commitment: "confirmed" }),
+      "initializeCvctAccountRecipient",
+      provider.connection,
+    );
+
+    await awaitComputationFinalization(
+      provider,
+      recipientComputationOffset,
+      program.programId,
+      "confirmed",
+    );
+
     // Fetch updated state to get current nonces for deposit inputs.
     const cvctMintBefore = await program.account.cvctMint.fetch(cvctMintPda);
     const vaultBefore = await program.account.vault.fetch(vaultPda);
@@ -440,13 +513,79 @@ describe("Cvct", () => {
       "confirmed",
     );
 
+    // Fetch state after burn to get current nonces for transfer.
+    const cvctAccountAfterBurn = await program.account.cvctAccount.fetch(
+      cvctAccountPda,
+    );
+    const recipientCvctAccountBefore = await program.account.cvctAccount.fetch(
+      recipientCvctAccountPda,
+    );
+
+    const transferComputationOffset = new anchor.BN(randomBytes(8));
+    const transferAmount = 100_000;
+    const newFromNonce = randomNonce();
+    const newToNonce = randomNonce();
+    const transferCompDefOffset = getCompDefAccOffset(COMP_DEF_TRANSFER);
+
+    console.log("Queuing transfer_cvct computation");
+    await rpcWithLogs(
+      program.methods
+        .transferCvct(
+          transferComputationOffset,
+          new anchor.BN(transferAmount),
+          Array.from(accountEncPubkey),
+          cvctAccountAfterBurn.balanceNonce,
+          newFromNonce.bn,
+          Array.from(recipientEncPubkey),
+          recipientCvctAccountBefore.balanceNonce,
+          newToNonce.bn,
+        )
+        .accountsPartial({
+          user: payer.publicKey,
+          fromCvctAccount: cvctAccountPda,
+          toCvctAccount: recipientCvctAccountPda,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          mxeAccount: getMXEAccAddress(program.programId),
+          mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
+          executingPool: getExecutingPoolAccAddress(
+            arciumEnv.arciumClusterOffset,
+          ),
+          computationAccount: getComputationAccAddress(
+            arciumEnv.arciumClusterOffset,
+            transferComputationOffset,
+          ),
+          compDefAccount: getCompDefAccAddress(
+            program.programId,
+            Buffer.from(transferCompDefOffset).readUInt32LE(),
+          ),
+          clusterAccount: getClusterAccAddress(arciumEnv.arciumClusterOffset),
+          poolAccount,
+          clockAccount,
+          arciumProgram: arciumProgramId,
+        })
+        .rpc({ skipPreflight: true, commitment: "confirmed" }),
+      "transferCvct",
+      provider.connection,
+    );
+
+    await awaitComputationFinalization(
+      provider,
+      transferComputationOffset,
+      program.programId,
+      "confirmed",
+    );
+
     // Fetch and print on-chain state after callback.
     const cvctMint = await program.account.cvctMint.fetch(cvctMintPda);
     const vault = await program.account.vault.fetch(vaultPda);
     const cvctAccount = await program.account.cvctAccount.fetch(cvctAccountPda);
+    const recipientCvctAccount = await program.account.cvctAccount.fetch(
+      recipientCvctAccountPda,
+    );
     console.log("cvct_mint", cvctMint);
     console.log("vault", vault);
     console.log("cvct_account", cvctAccount);
+    console.log("recipient_cvct_account", recipientCvctAccount);
 
     // Decrypt balances to confirm plaintext changes.
     const decryptedBalance = decryptSharedU128(
@@ -467,16 +606,25 @@ describe("Cvct", () => {
       authorityKey,
       mxePublicKey,
     );
+    const decryptedRecipientBalance = decryptSharedU128(
+      Uint8Array.from(recipientCvctAccount.balance[0]),
+      Buffer.from(recipientCvctAccount.balanceNonce.toArray("le", 16)),
+      recipientEncKey,
+      mxePublicKey,
+    );
 
     console.log("decrypted_balance", decryptedBalance.toString());
     console.log("decrypted_total_supply", decryptedSupply.toString());
     console.log("decrypted_total_locked", decryptedLocked.toString());
 
-    const expectedBalance = BigInt(depositAmount - burnAmount);
+    const expectedBalance = BigInt(
+      depositAmount - burnAmount - transferAmount,
+    );
     const expectedSupply = BigInt(depositAmount - burnAmount);
     const expectedLocked = BigInt(depositAmount - burnAmount);
 
     expect(decryptedBalance).to.equal(expectedBalance);
+    expect(decryptedRecipientBalance).to.equal(BigInt(transferAmount));
     expect(decryptedSupply).to.equal(expectedSupply);
     expect(decryptedLocked).to.equal(expectedLocked);
 
@@ -714,6 +862,59 @@ async function initBurnAndWithdrawCompDef(
   );
 }
 
+async function initTransferCvctCompDef(
+  program: Program<Cvct>,
+  payer: anchor.Wallet,
+): Promise<void> {
+  const baseSeedCompDefAcc = getArciumAccountBaseSeed(
+    "ComputationDefinitionAccount",
+  );
+  const offset = getCompDefAccOffset(COMP_DEF_TRANSFER);
+
+  const compDefPDA = PublicKey.findProgramAddressSync(
+    [baseSeedCompDefAcc, program.programId.toBuffer(), offset],
+    getArciumProgramId(),
+  )[0];
+
+  await rpcWithLogs(
+    program.methods
+      .initTransferCvctCompDef()
+      .accountsPartial({
+        compDefAccount: compDefPDA,
+        payer: payer.publicKey,
+        mxeAccount: getMXEAccAddress(program.programId),
+        arciumProgram: getArciumProgramId(),
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([payer.payer])
+      .rpc({
+        commitment: "confirmed",
+      }),
+    "initTransferCvctCompDef",
+    program.provider.connection,
+  );
+
+  const finalizeTx = await buildFinalizeCompDefTx(
+    program.provider as anchor.AnchorProvider,
+    Buffer.from(offset).readUInt32LE(),
+    program.programId,
+  );
+
+  const latestBlockhash = await getLatestBlockhashWithRetry(
+    program.provider.connection,
+  );
+  finalizeTx.recentBlockhash = latestBlockhash.blockhash;
+  finalizeTx.lastValidBlockHeight = latestBlockhash.lastValidBlockHeight;
+
+  finalizeTx.sign(payer.payer);
+
+  await rpcWithLogs(
+    program.provider.sendAndConfirm(finalizeTx),
+    "finalizeTransferCompDef",
+    program.provider.connection,
+  );
+}
+
 // Simple retry for blockhash fetch (localnet may lag during boot).
 async function getLatestBlockhashWithRetry(
   connection: anchor.web3.Connection,
@@ -729,6 +930,41 @@ async function getLatestBlockhashWithRetry(
     }
   }
   throw new Error("unreachable");
+}
+
+async function transferLamports(
+  connection: anchor.web3.Connection,
+  from: anchor.web3.Keypair,
+  to: PublicKey,
+  lamports: number,
+): Promise<string> {
+  const ix = anchor.web3.SystemProgram.transfer({
+    fromPubkey: from.publicKey,
+    toPubkey: to,
+    lamports,
+  });
+
+  const tx = new anchor.web3.Transaction().add(ix);
+  tx.feePayer = from.publicKey;
+
+  const latest = await getLatestBlockhashWithRetry(connection);
+  tx.recentBlockhash = latest.blockhash;
+
+  tx.sign(from);
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    preflightCommitment: "confirmed",
+  });
+
+  await connection.confirmTransaction(
+    {
+      signature: sig,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight,
+    },
+    "confirmed",
+  );
+
+  return sig;
 }
 
 // Helper to surface logs on transaction failure for faster debugging.

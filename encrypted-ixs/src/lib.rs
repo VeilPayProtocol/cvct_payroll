@@ -75,4 +75,26 @@ mod circuits {
             amount,
         )
     }
+
+    #[instruction]
+    pub fn transfer_cvct(
+        from_balance: Enc<Shared, u128>,
+        amount: u128,
+        from_out: Shared,
+        to_balance: Enc<Shared, u128>,
+        to_out: Shared,
+    ) -> (Enc<Shared, u128>, Enc<Shared, u128>, bool) {
+        let from = from_balance.to_arcis();
+        let to = to_balance.to_arcis();
+        let ok = from >= amount;
+
+        let new_from = if ok { from - amount } else { from };
+        let new_to = if ok { to + amount } else { to };
+
+        (
+            from_out.from_arcis(new_from),
+            to_out.from_arcis(new_to),
+            ok.reveal(),
+        )
+    }
 }
