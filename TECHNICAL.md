@@ -1,8 +1,8 @@
-# Primitive Confidential Vault‑Backed Accounts
+# Primitive Confidential Vault‑Backed Accounts (CVCT)
 
 ## Abstract
 
-This document describes **Primitive Confidential Vault‑Backed Accounts (PCVBAs)** — a minimal, composable privacy primitive for Solana‑based systems. PCVBAs decouple *ownership*, *balance confidentiality*, and *execution authorization* by introducing vault‑backed accounts whose sensitive state is never revealed on‑chain in plaintext. Instead, correctness is enforced through constrained program logic, commitments, and verifiable transitions.
+This document describes **Primitive Confidential Vault‑Backed Accounts (PCVBAs)** — a minimal, composable privacy primitive for Solana‑based systems implemented as **CVCT** in this repository. PCVBAs decouple *ownership*, *balance confidentiality*, and *execution authorization* by introducing vault‑backed accounts whose sensitive state is never revealed on‑chain in plaintext. Correctness is enforced through program constraints and cryptographic transitions.
 
 The goal is not to build a monolithic privacy protocol, but to provide a **primitive** that other programs (payroll, DAOs, marketplaces, reputation systems) can integrate with minimal surface area and predictable security guarantees.
 
@@ -53,7 +53,7 @@ A **Confidential Vault‑Backed Account** is composed of:
    Holds real assets (SOL or SPL tokens). This account is fully on‑chain and auditable.
 
 2. **Confidential Account State**
-   Stores *commitments* to balances and metadata, rather than plaintext values.
+   Stores encrypted balances and metadata, rather than plaintext values.
 
 3. **Program‑Enforced Transitions**
    State transitions are validated by the program using invariant checks instead of revealing values.
@@ -93,8 +93,7 @@ The vault never moves funds unless a valid confidential transition is proven.
 ### 2. Confidential Account
 
 Stores:
-
-* balance commitment (e.g. hash or encrypted value)
+* encrypted balance (`Euint128` via INCO Lightning)
 * nonce / version
 * authority reference
 
@@ -103,8 +102,8 @@ Example (conceptual):
 ```text
 ConfidentialAccount {
   authority: Pubkey,
-  balance_commitment: [u8; 32],
-  version: u64,
+  balance: Euint128,
+  nonce: u64,
 }
 ```
 
@@ -115,18 +114,18 @@ ConfidentialAccount {
 ### Deposit
 
 * User transfers assets into the vault
-* Program updates balance commitment
-* No plaintext amount is revealed on‑chain
+* Program updates encrypted balance, total supply, and total locked via CPI
+* No plaintext balances are revealed on‑chain
 
 ### Withdrawal
 
-* Program validates commitment decrement
+* Program validates encrypted decrement via CPI
 * Assets are released from the vault
 * Public observers see only the vault movement, not internal balances
 
 ### Internal Transfer
 
-* Two confidential accounts update commitments atomically
+* Two confidential accounts update encrypted balances atomically
 * Vault balance remains unchanged
 
 ---
@@ -136,16 +135,14 @@ ConfidentialAccount {
 PCVBAs **do not rely on secrecy of code or validators**.
 
 Confidentiality is achieved by:
-
 * never storing balances in plaintext
 * never emitting sensitive values in logs
-* enforcing arithmetic through commitment equality
+* enforcing arithmetic via **INCO Lightning encrypted arithmetic** (`Euint128`)
 
-The exact cryptographic primitive is abstracted and may be:
-
-* hash‑based commitments
-* encrypted balances
-* zero‑knowledge proofs (future extension)
+INCO Lightning provides:
+* `as_euint128` for encryption of plaintext inputs
+* `e_add`, `e_sub`, `e_ge`, `e_select` for encrypted arithmetic and comparisons
+* `allow` to grant account owners decryption access to their balances
 
 ---
 
@@ -154,7 +151,7 @@ The exact cryptographic primitive is abstracted and may be:
 The program enforces:
 
 1. **Conservation of Value**
-   Vault balance ≥ sum of all committed balances
+   Vault balance ≥ sum of all encrypted balances
 
 2. **Authorized Transitions Only**
    Only the account authority can update commitments
@@ -238,7 +235,6 @@ All without changing the vault interface.
 ## Auditability
 
 Although balances are confidential:
-
 * vault balances are public
 * program logic is deterministic
 * invariants are verifiable
@@ -250,7 +246,6 @@ This strikes a balance between **privacy and trust minimization**.
 ## Hackathon Relevance
 
 This project provides:
-
 * a **foundational privacy building block**
 * immediate composability with existing Solana programs
 * a clear path toward stronger cryptographic privacy
@@ -264,3 +259,7 @@ Rather than another end‑user app, PCVBAs expand the design space for *all* Sol
 Primitive Confidential Vault‑Backed Accounts introduce a lightweight, enforceable privacy layer for on‑chain assets. By separating custody from disclosure, they enable confidential value flows while preserving Solana’s transparency and performance characteristics.
 
 This primitive is intended to be **built upon**, not locked into a single application — aligning with the long‑term needs of privacy‑preserving on‑chain systems.
+
+---
+
+**Migration note:** We are moving the confidential computation layer from **INCO Lightning** to **Arcium** to address the current `burn_and_withdraw` edge case and improve MPC‑style workflows going forward.

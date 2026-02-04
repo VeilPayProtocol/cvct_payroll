@@ -1,121 +1,54 @@
-# Structure of this project
+# CVCT Payroll — Confidential Vault‑Backed Tokens
 
-This project is structured pretty similarly to how a regular Solana Anchor project is structured. The main difference lies in there being two places to write code here:
+CVCT is a privacy‑preserving token layer for Solana that keeps balances and payroll flows confidential while staying fully backed by on‑chain SPL assets. The current main‑branch implementation uses **INCO Lightning** to store and update encrypted values on chain through CPI. This gives us verifiable, auditable custody (the vault) with private accounting (encrypted balances).
 
-- The `programs` dir like usual Anchor programs
-- The `encrypted-ixs` dir for confidential computing instructions
+This repo demonstrates:
+1. A **confidential mint** for each backing SPL token.
+1. **Vault‑backed** deposits and withdrawals.
+1. **Private transfers** between CVCT accounts.
+1. A **payroll module** built on top of the confidential balance layer.
 
-When working with plaintext data, we can edit it inside our program as normal. When working with confidential data though, state transitions take place off-chain using the Arcium network as a co-processor. For this, we then always need two instructions in our program: one that gets called to initialize a confidential computation, and one that gets called when the computation is done and supplies the resulting data. Additionally, since the types and operations in a Solana program and in a confidential computing environment are a bit different, we define the operations themselves in the `encrypted-ixs` dir using our Rust-based framework called Arcis. To link all of this together, we provide a few macros that take care of ensuring the correct accounts and data are passed for the specific initialization and callback functions:
+## Why This Matters (Hackathon Summary)
 
-```rust
-// encrypted-ixs/add_together.rs
+Solana’s transparency is powerful but problematic for payroll, treasury ops, and competitive business workflows. CVCT makes those use cases viable by separating:
+1. **Custody** (public, auditable vaults of SPL tokens).
+1. **Accounting** (encrypted balances and state transitions).
+1. **Authorization** (standard Anchor constraints + INCO encryption permissions).
 
-use arcis::*;
+This creates a minimal privacy primitive that can plug into DAOs, payroll systems, or other DeFi flows without redesigning the base assets.
 
-#[encrypted]
-mod circuits {
-    use arcis::*;
+## Architecture Overview
 
-    pub struct InputValues {
-        v1: u8,
-        v2: u8,
-    }
+**On‑chain accounts**
+1. `CvctMint`: metadata for a confidential mint, backed 1:1 by an SPL mint.
+1. `Vault`: PDA that holds the backing SPL tokens.
+1. `CvctAccount`: per‑user confidential balance account.
 
-    #[instruction]
-    pub fn add_together(input_ctxt: Enc<Shared, InputValues>) -> Enc<Shared, u16> {
-        let input = input_ctxt.to_arcis();
-        let sum = input.v1 as u16 + input.v2 as u16;
-        input_ctxt.owner.from_arcis(sum)
-    }
-}
+**State transitions**
+1. `initialize_cvct_mint`: creates the mint and vault, initializes encrypted totals.
+1. `initialize_cvct_account`: creates a user account with encrypted zero balance.
+1. `deposit_and_mint`: transfer SPL into vault, then add encrypted balance/supply/locked.
+1. `burn_and_withdraw`: subtract encrypted balances, then release SPL from vault.
+1. `transfer_cvct`: encrypted balance transfer between users.
 
-// programs/my_program/src/lib.rs
+**Privacy layer (INCO Lightning)**
+1. Encrypted values are stored as `Euint128`.
+1. Arithmetic is done through CPI calls such as `e_add`, `e_sub`, and `e_ge`.
+1. `allow` grants the account owner access to decrypt their own balance.
 
-use anchor_lang::prelude::*;
-use arcium_anchor::prelude::*;
+## Repo Layout
 
-declare_id!("<some ID>");
+1. `programs/cvct_payroll`: Anchor program with CVCT + payroll instructions.
+1. `tests/cvct_payroll.ts`: integration tests for the confidential flow.
+1. `runbooks/`: deployment and ops workflows.
 
-#[arcium_program]
-pub mod my_program {
-    use super::*;
+## Running Locally
 
-    pub fn init_add_together_comp_def(ctx: Context<InitAddTogetherCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, None, None)?;
-        Ok(())
-    }
+1. Build: `anchor build`
+1. Test: `anchor test`
 
-    pub fn add_together(
-        ctx: Context<AddTogether>,
-        computation_offset: u64,
-        ciphertext_0: [u8; 32],
-        ciphertext_1: [u8; 32],
-        pubkey: [u8; 32],
-        nonce: u128,
-    ) -> Result<()> {
-        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
-        let args = ArgBuilder::new()
-            .x25519_pubkey(pubkey)
-            .plaintext_u128(nonce)
-            .encrypted_u8(ciphertext_0)
-            .encrypted_u8(ciphertext_1)
-            .build();
+This repo assumes INCO Lightning is available on your localnet or configured cluster.
 
-        queue_computation(
-            ctx.accounts,
-            computation_offset,
-            args,
-            None,
-            vec![AddTogetherCallback::callback_ix(
-                computation_offset,
-                &ctx.accounts.mxe_account,
-                &[]
-            )?],
-            1,
-            0,
-        )?;
-        Ok(())
-    }
+## Note on Migration
 
-    #[arcium_callback(encrypted_ix = "add_together")]
-    pub fn add_together_callback(
-        ctx: Context<AddTogetherCallback>,
-        output: SignedComputationOutputs<AddTogetherOutput>,
-    ) -> Result<()> {
-        let o = match output.verify_output(&ctx.accounts.cluster_account, &ctx.accounts.computation_account) {
-            Ok(AddTogetherOutput { field_0 }) => field_0,
-            Err(_) => return Err(ErrorCode::AbortedComputation.into()),
-        };
-
-        emit!(SumEvent {
-            sum: o.ciphertexts[0],
-            nonce: o.nonce.to_le_bytes(),
-        });
-        Ok(())
-    }
-}
-
-#[queue_computation_accounts("add_together", payer)]
-#[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct AddTogether<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
-
-#[callback_accounts("add_together")]
-#[derive(Accounts)]
-pub struct AddTogetherCallback<'info> {
-    // ... required accounts
-    pub some_extra_acc: AccountInfo<'info>,
-}
-
-#[init_computation_definition_accounts("add_together", payer)]
-#[derive(Accounts)]
-pub struct InitAddTogetherCompDef<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
-```
+We are actively migrating the confidential computation layer from **INCO Lightning** to **Arcium**. The main motivation is to fix the current `burn_and_withdraw` edge case in the INCO version and to support a clearer MPC‑style flow going forward.

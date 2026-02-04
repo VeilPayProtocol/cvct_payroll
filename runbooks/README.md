@@ -1,5 +1,7 @@
 # cvct_payroll Runbooks
 
+These runbooks support the CVCT confidential vault‑backed token program (INCO Lightning version). Use them for repeatable deployments and on‑chain operations during development and demos.
+
 [![Surfpool](https://img.shields.io/badge/Operated%20with-Surfpool-gree?labelColor=gray)](https://surfpool.run)
 
 ## Available Runbooks
