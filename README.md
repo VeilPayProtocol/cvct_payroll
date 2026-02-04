@@ -1,121 +1,55 @@
-# Structure of this project
+# CVCT (Arcium) — Confidential Vault‑Backed Tokens
 
-This project is structured pretty similarly to how a regular Solana Anchor project is structured. The main difference lies in there being two places to write code here:
+CVCT is a privacy‑preserving token layer for Solana that keeps balances and payroll flows confidential while remaining fully backed by on‑chain SPL assets. This branch uses **Arcium** as the confidential co‑processor: all sensitive state transitions happen inside MPC, while custody remains on Solana.
 
-- The `programs` dir like usual Anchor programs
-- The `encrypted-ixs` dir for confidential computing instructions
+## Hackathon Summary
 
-When working with plaintext data, we can edit it inside our program as normal. When working with confidential data though, state transitions take place off-chain using the Arcium network as a co-processor. For this, we then always need two instructions in our program: one that gets called to initialize a confidential computation, and one that gets called when the computation is done and supplies the resulting data. Additionally, since the types and operations in a Solana program and in a confidential computing environment are a bit different, we define the operations themselves in the `encrypted-ixs` dir using our Rust-based framework called Arcis. To link all of this together, we provide a few macros that take care of ensuring the correct accounts and data are passed for the specific initialization and callback functions:
+Solana is transparent by default. CVCT makes payroll, treasury ops, and confidential DeFi flows possible by separating:
+1. **Custody** — public vaults hold real SPL assets.
+1. **Accounting** — encrypted balances and totals are updated via MPC.
+1. **Authorization** — Anchor constraints enforce who can trigger updates.
 
-```rust
-// encrypted-ixs/add_together.rs
+CVCT is a **primitive** that other programs can build on, not a single closed system.
 
-use arcis::*;
+## Core Components
 
-#[encrypted]
-mod circuits {
-    use arcis::*;
+**On‑chain accounts**
+1. `CvctMint`: metadata for a confidential mint, backed 1:1 by an SPL mint.
+1. `Vault`: PDA that holds the backing SPL tokens.
+1. `CvctAccount`: per‑user confidential balance account.
 
-    pub struct InputValues {
-        v1: u8,
-        v2: u8,
-    }
+**Confidential circuits (Arcis)**
+1. `init_mint_state` — encrypts zeros for total supply and total locked.
+1. `init_account_state` — encrypts zero balance for a new account.
+1. `deposit_and_mint` — adds amount to encrypted balance/supply/locked.
+1. `burn_and_withdraw` — subtracts amount if balance permits and returns a boolean.
+1. `transfer_cvct` — transfers between encrypted balances.
 
-    #[instruction]
-    pub fn add_together(input_ctxt: Enc<Shared, InputValues>) -> Enc<Shared, u16> {
-        let input = input_ctxt.to_arcis();
-        let sum = input.v1 as u16 + input.v2 as u16;
-        input_ctxt.owner.from_arcis(sum)
-    }
-}
+**Arcium flow**
+1. Instruction queues computation via `queue_computation`.
+1. MPC executes the Arcis circuit.
+1. Callback writes ciphertexts + nonces back on‑chain.
 
-// programs/my_program/src/lib.rs
+## Repo Layout
 
-use anchor_lang::prelude::*;
-use arcium_anchor::prelude::*;
+1. `programs/cvct`: Anchor program that queues computations and writes callbacks.
+1. `encrypted-ixs`: Arcis circuits for encrypted state transitions.
+1. `tests`: End‑to‑end tests that decrypt balances client‑side to verify correctness.
 
-declare_id!("<some ID>");
+## Why Arcium Improves Privacy
 
-#[arcium_program]
-pub mod my_program {
-    use super::*;
+Arcium provides:
+1. **Confidential computation** over encrypted values.
+1. **Verified outputs** via callback signature checks.
+1. **Minimal on‑chain leakage** (ciphertexts + nonces only).
 
-    pub fn init_add_together_comp_def(ctx: Context<InitAddTogetherCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, None, None)?;
-        Ok(())
-    }
+This removes the need for custom cryptography in the program while keeping custody on Solana.
 
-    pub fn add_together(
-        ctx: Context<AddTogether>,
-        computation_offset: u64,
-        ciphertext_0: [u8; 32],
-        ciphertext_1: [u8; 32],
-        pubkey: [u8; 32],
-        nonce: u128,
-    ) -> Result<()> {
-        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
-        let args = ArgBuilder::new()
-            .x25519_pubkey(pubkey)
-            .plaintext_u128(nonce)
-            .encrypted_u8(ciphertext_0)
-            .encrypted_u8(ciphertext_1)
-            .build();
+## Running Locally
 
-        queue_computation(
-            ctx.accounts,
-            computation_offset,
-            args,
-            None,
-            vec![AddTogetherCallback::callback_ix(
-                computation_offset,
-                &ctx.accounts.mxe_account,
-                &[]
-            )?],
-            1,
-            0,
-        )?;
-        Ok(())
-    }
+1. Build: `arcium build`
+1. Test: `arcium test`
 
-    #[arcium_callback(encrypted_ix = "add_together")]
-    pub fn add_together_callback(
-        ctx: Context<AddTogetherCallback>,
-        output: SignedComputationOutputs<AddTogetherOutput>,
-    ) -> Result<()> {
-        let o = match output.verify_output(&ctx.accounts.cluster_account, &ctx.accounts.computation_account) {
-            Ok(AddTogetherOutput { field_0 }) => field_0,
-            Err(_) => return Err(ErrorCode::AbortedComputation.into()),
-        };
+## Note
 
-        emit!(SumEvent {
-            sum: o.ciphertexts[0],
-            nonce: o.nonce.to_le_bytes(),
-        });
-        Ok(())
-    }
-}
-
-#[queue_computation_accounts("add_together", payer)]
-#[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct AddTogether<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
-
-#[callback_accounts("add_together")]
-#[derive(Accounts)]
-pub struct AddTogetherCallback<'info> {
-    // ... required accounts
-    pub some_extra_acc: AccountInfo<'info>,
-}
-
-#[init_computation_definition_accounts("add_together", payer)]
-#[derive(Accounts)]
-pub struct InitAddTogetherCompDef<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
-```
+This branch is the forward path of CVCT. It replaces earlier INCO‑based encrypted arithmetic with Arcium MPC to improve correctness and privacy guarantees for withdrawals and transfers.
