@@ -17,4 +17,11 @@ mod circuits {
             vault.from_arcis(0u128),
         )
     }
+
+    #[instruction]
+    pub fn init_account_state(owner: Shared) -> Enc<Shared, u128> {
+        // Initializes an encrypted zero balance for a CVCT account.
+        // The `owner` input is the account owner's encryption context.
+        owner.from_arcis(0u128)
+    }
 }

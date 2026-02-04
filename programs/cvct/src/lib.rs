@@ -7,6 +7,7 @@ use arcium_anchor::prelude::*;
 use arcium_client::idl::arcium::types::CallbackAccount;
 
 const COMP_DEF_OFFSET_INIT_MINT_STATE: u32 = comp_def_offset("init_mint_state");
+const COMP_DEF_OFFSET_INIT_ACCOUNT_STATE: u32 = comp_def_offset("init_account_state");
 const ENCRYPTED_U128_CIPHERTEXTS: usize = 1;
 
 declare_id!("B4rLKdnQsFH2e4CBefgWsBXZ7xsX4ewb7QUiMim4Nbvj");
@@ -17,6 +18,12 @@ pub mod cvct {
 
     pub fn init_mint_state_comp_def(ctx: Context<InitMintStateCompDef>) -> Result<()> {
         // Registers the confidential circuit interface on-chain so Arcium can verify queued jobs.
+        init_comp_def(ctx.accounts, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_account_state_comp_def(ctx: Context<InitAccountStateCompDef>) -> Result<()> {
+        // Registers the confidential circuit interface for initializing CVCT accounts.
         init_comp_def(ctx.accounts, None, None)?;
         Ok(())
     }
@@ -128,6 +135,75 @@ pub mod cvct {
 
         Ok(())
     }
+
+    pub fn initialize_cvct_account(
+        ctx: Context<InitializeCvctAccount>,
+        computation_offset: u64,
+        owner_enc_pubkey: [u8; 32],
+        owner_nonce: u128,
+    ) -> Result<()> {
+        let cvct_account_key = ctx.accounts.cvct_account.key();
+        let cvct_mint_key = ctx.accounts.cvct_mint.key();
+        let owner_key = ctx.accounts.owner.key();
+
+        {
+            let cvct_account = &mut ctx.accounts.cvct_account;
+            cvct_account.set_inner(CvctAccount {
+                owner: owner_key,
+                cvct_mint: cvct_mint_key,
+                owner_enc_pubkey,
+                balance: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+                balance_nonce: 0,
+            });
+        }
+
+        // Build Arcium args to create an encrypted zero balance.
+        let args = ArgBuilder::new()
+            .x25519_pubkey(owner_enc_pubkey)
+            .plaintext_u128(owner_nonce)
+            .build();
+
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![InitAccountStateCallback::callback_ix(
+                computation_offset,
+                &ctx.accounts.mxe_account,
+                &[CallbackAccount {
+                    pubkey: cvct_account_key,
+                    is_writable: true,
+                }],
+            )?],
+            1,
+            0,
+        )?;
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "init_account_state")]
+    pub fn init_account_state_callback(
+        ctx: Context<InitAccountStateCallback>,
+        output: SignedComputationOutputs<InitAccountStateOutput>,
+    ) -> Result<()> {
+        let balance = match output.verify_output(
+            &ctx.accounts.cluster_account,
+            &ctx.accounts.computation_account,
+        ) {
+            Ok(InitAccountStateOutput { field_0 }) => field_0,
+            Err(_) => return Err(ErrorCode::AbortedComputation.into()),
+        };
+
+        let cvct_account = &mut ctx.accounts.cvct_account;
+        cvct_account.balance = balance.ciphertexts;
+        cvct_account.balance_nonce = balance.nonce;
+
+        Ok(())
+    }
 }
 
 #[account]
@@ -161,6 +237,23 @@ pub struct Vault {
 }
 
 impl Vault {
+    pub const LEN: usize =
+        32 + 32 + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS) + 16;
+}
+
+#[account]
+pub struct CvctAccount {
+    pub owner: Pubkey,
+    pub cvct_mint: Pubkey,
+    /// X25519 pubkey used to encrypt/decrypt this account's balance.
+    pub owner_enc_pubkey: [u8; 32],
+    /// Encrypted balance (1 ciphertext for u128).
+    pub balance: [[u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+    /// Nonce used with the encrypted balance.
+    pub balance_nonce: u128,
+}
+
+impl CvctAccount {
     pub const LEN: usize =
         32 + 32 + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS) + 16;
 }
@@ -279,9 +372,116 @@ pub struct InitMintStateCallback<'info> {
     pub vault: Box<Account<'info, Vault>>,
 }
 
+#[queue_computation_accounts("init_account_state", owner)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct InitializeCvctAccount<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(
+        init_if_needed,
+        space = 9,
+        payer = owner,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    /// Arcium signer PDA used to sign the queued computation.
+    pub sign_pda_account: Box<Account<'info, ArciumSignerAccount>>,
+    #[account(address = derive_mxe_pda!())]
+    /// MXE account identifies the Arcium execution environment.
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(
+        mut,
+        address = derive_mempool_pda!(mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// CHECK: mempool_account, checked by the arcium program.
+    pub mempool_account: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        address = derive_execpool_pda!(mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// CHECK: executing_pool, checked by the arcium program.
+    pub executing_pool: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        address = derive_comp_pda!(computation_offset, mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_INIT_ACCOUNT_STATE))]
+    /// On-chain computation definition for `init_account_state`.
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(
+        mut,
+        address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// Cluster state used for output verification.
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    /// Fee pool used by Arcium.
+    pub pool_account: Box<Account<'info, FeePool>>,
+    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    /// Arcium clock account.
+    pub clock_account: Box<Account<'info, ClockAccount>>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(
+        init,
+        payer = owner,
+        space = 8 + CvctAccount::LEN,
+        seeds = [b"cvct_account", cvct_mint.key().as_ref(), owner.key().as_ref()],
+        bump,
+    )]
+    /// CVCT account metadata (encrypted balance updated by callback).
+    pub cvct_account: Box<Account<'info, CvctAccount>>,
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+}
+
+#[callback_accounts("init_account_state")]
+#[derive(Accounts)]
+pub struct InitAccountStateCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_INIT_ACCOUNT_STATE))]
+    /// Same computation definition as queued instruction.
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(address = derive_mxe_pda!())]
+    /// MXE account for this computation.
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    /// CHECK: computation_account, checked by arcium program via constraints in the callback context.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(
+        address = derive_cluster_pda!(mxe_account, ErrorCode::ClusterNotSet)
+    )]
+    /// Cluster account used to verify Arcium output signature.
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    /// CHECK: instructions_sysvar, checked by the account constraint
+    pub instructions_sysvar: AccountInfo<'info>,
+    #[account(mut)]
+    /// CVCT account to update encrypted balance.
+    pub cvct_account: Box<Account<'info, CvctAccount>>,
+}
+
 #[init_computation_definition_accounts("init_mint_state", payer)]
 #[derive(Accounts)]
 pub struct InitMintStateCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    /// MXE account required to initialize comp def.
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut)]
+    /// CHECK: comp_def_account, checked by arcium program.
+    /// Can't check it here as it's not initialized yet.
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("init_account_state", payer)]
+#[derive(Accounts)]
+pub struct InitAccountStateCompDef<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
