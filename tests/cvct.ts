@@ -5,6 +5,7 @@ import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   createMint,
+  getAccount,
   getAssociatedTokenAddress,
   getOrCreateAssociatedTokenAccount,
   mintTo,
@@ -29,11 +30,13 @@ import {
   x25519,
 } from "@arcium-hq/client";
 import { Cvct } from "../target/types/cvct";
+import { expect } from "chai";
 
 // Confidential circuit names compiled in encrypted-ixs.
 const COMP_DEF_MINT = "init_mint_state";
 const COMP_DEF_ACCOUNT = "init_account_state";
 const COMP_DEF_DEPOSIT = "deposit_and_mint";
+const COMP_DEF_BURN = "burn_and_withdraw";
 
 // Helper: produce a random 128-bit nonce as both bytes and BN.
 function randomNonce(): { bytes: Uint8Array; bn: anchor.BN } {
@@ -111,6 +114,10 @@ describe("Cvct", () => {
     console.log("Initializing deposit_and_mint comp def");
     await initDepositAndMintCompDef(program, payer);
     console.log("Deposit comp def initialized");
+
+    console.log("Initializing burn_and_withdraw comp def");
+    await initBurnAndWithdrawCompDef(program, payer);
+    console.log("Burn comp def initialized");
 
     // Backing SPL mint the CVCT mint will wrap.
     const backingMint = await createMint(
@@ -362,6 +369,77 @@ describe("Cvct", () => {
       "confirmed",
     );
 
+    const cvctMintAfterDeposit = await program.account.cvctMint.fetch(
+      cvctMintPda,
+    );
+    const vaultAfterDeposit = await program.account.vault.fetch(vaultPda);
+    const cvctAccountAfterDeposit = await program.account.cvctAccount.fetch(
+      cvctAccountPda,
+    );
+
+    const burnComputationOffset = new anchor.BN(randomBytes(8));
+    const burnAmount = 200_000;
+    const newBurnBalanceNonce = randomNonce();
+    const newBurnSupplyNonce = randomNonce();
+    const newBurnLockedNonce = randomNonce();
+
+    const burnCompDefOffset = getCompDefAccOffset(COMP_DEF_BURN);
+
+    console.log("Queuing burn_and_withdraw computation");
+    await rpcWithLogs(
+      program.methods
+        .burnAndWithdraw(
+          burnComputationOffset,
+          new anchor.BN(burnAmount),
+          Array.from(accountEncPubkey),
+          cvctAccountAfterDeposit.balanceNonce,
+          newBurnBalanceNonce.bn,
+          Array.from(authorityPubkey),
+          cvctMintAfterDeposit.totalSupplyNonce,
+          newBurnSupplyNonce.bn,
+          Array.from(authorityPubkey),
+          vaultAfterDeposit.totalLockedNonce,
+          newBurnLockedNonce.bn,
+        )
+        .accountsPartial({
+          user: payer.publicKey,
+          cvctMint: cvctMintPda,
+          vault: vaultPda,
+          cvctAccount: cvctAccountPda,
+          userTokenAccount: userTokenAccount.address,
+          vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          mxeAccount: getMXEAccAddress(program.programId),
+          mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
+          executingPool: getExecutingPoolAccAddress(
+            arciumEnv.arciumClusterOffset,
+          ),
+          computationAccount: getComputationAccAddress(
+            arciumEnv.arciumClusterOffset,
+            burnComputationOffset,
+          ),
+          compDefAccount: getCompDefAccAddress(
+            program.programId,
+            Buffer.from(burnCompDefOffset).readUInt32LE(),
+          ),
+          clusterAccount: getClusterAccAddress(arciumEnv.arciumClusterOffset),
+          poolAccount,
+          clockAccount,
+          arciumProgram: arciumProgramId,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc({ skipPreflight: true, commitment: "confirmed" }),
+      "burnAndWithdraw",
+      provider.connection,
+    );
+
+    await awaitComputationFinalization(
+      provider,
+      burnComputationOffset,
+      program.programId,
+      "confirmed",
+    );
+
     // Fetch and print on-chain state after callback.
     const cvctMint = await program.account.cvctMint.fetch(cvctMintPda);
     const vault = await program.account.vault.fetch(vaultPda);
@@ -393,6 +471,30 @@ describe("Cvct", () => {
     console.log("decrypted_balance", decryptedBalance.toString());
     console.log("decrypted_total_supply", decryptedSupply.toString());
     console.log("decrypted_total_locked", decryptedLocked.toString());
+
+    const expectedBalance = BigInt(depositAmount - burnAmount);
+    const expectedSupply = BigInt(depositAmount - burnAmount);
+    const expectedLocked = BigInt(depositAmount - burnAmount);
+
+    expect(decryptedBalance).to.equal(expectedBalance);
+    expect(decryptedSupply).to.equal(expectedSupply);
+    expect(decryptedLocked).to.equal(expectedLocked);
+
+    const userTokenAfter = await getAccount(
+      provider.connection,
+      userTokenAccount.address,
+    );
+    const vaultTokenAfter = await getAccount(
+      provider.connection,
+      vaultTokenAccount,
+    );
+
+    expect(Number(userTokenAfter.amount)).to.equal(
+      1_000_000 - depositAmount + burnAmount,
+    );
+    expect(Number(vaultTokenAfter.amount)).to.equal(
+      depositAmount - burnAmount,
+    );
   });
 });
 
@@ -555,6 +657,59 @@ async function initDepositAndMintCompDef(
   await rpcWithLogs(
     program.provider.sendAndConfirm(finalizeTx),
     "finalizeDepositCompDef",
+    program.provider.connection,
+  );
+}
+
+async function initBurnAndWithdrawCompDef(
+  program: Program<Cvct>,
+  payer: anchor.Wallet,
+): Promise<void> {
+  const baseSeedCompDefAcc = getArciumAccountBaseSeed(
+    "ComputationDefinitionAccount",
+  );
+  const offset = getCompDefAccOffset(COMP_DEF_BURN);
+
+  const compDefPDA = PublicKey.findProgramAddressSync(
+    [baseSeedCompDefAcc, program.programId.toBuffer(), offset],
+    getArciumProgramId(),
+  )[0];
+
+  await rpcWithLogs(
+    program.methods
+      .initBurnAndWithdrawCompDef()
+      .accountsPartial({
+        compDefAccount: compDefPDA,
+        payer: payer.publicKey,
+        mxeAccount: getMXEAccAddress(program.programId),
+        arciumProgram: getArciumProgramId(),
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([payer.payer])
+      .rpc({
+        commitment: "confirmed",
+      }),
+    "initBurnAndWithdrawCompDef",
+    program.provider.connection,
+  );
+
+  const finalizeTx = await buildFinalizeCompDefTx(
+    program.provider as anchor.AnchorProvider,
+    Buffer.from(offset).readUInt32LE(),
+    program.programId,
+  );
+
+  const latestBlockhash = await getLatestBlockhashWithRetry(
+    program.provider.connection,
+  );
+  finalizeTx.recentBlockhash = latestBlockhash.blockhash;
+  finalizeTx.lastValidBlockHeight = latestBlockhash.lastValidBlockHeight;
+
+  finalizeTx.sign(payer.payer);
+
+  await rpcWithLogs(
+    program.provider.sendAndConfirm(finalizeTx),
+    "finalizeBurnCompDef",
     program.provider.connection,
   );
 }
