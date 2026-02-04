@@ -24,4 +24,26 @@ mod circuits {
         // The `owner` input is the account owner's encryption context.
         owner.from_arcis(0u128)
     }
+
+    #[instruction]
+    pub fn deposit_and_mint(
+        balance: Enc<Shared, u128>,
+        amount: u128,
+        owner_out: Shared,
+        total_supply: Enc<Shared, u128>,
+        mint_out: Shared,
+        total_locked: Enc<Shared, u128>,
+        vault_out: Shared,
+    ) -> (Enc<Shared, u128>, Enc<Shared, u128>, Enc<Shared, u128>) {
+        // Add plaintext deposit amount to encrypted balance, supply, and locked totals.
+        let new_balance = balance.to_arcis() + amount;
+        let new_total_supply = total_supply.to_arcis() + amount;
+        let new_total_locked = total_locked.to_arcis() + amount;
+
+        (
+            owner_out.from_arcis(new_balance),
+            mint_out.from_arcis(new_total_supply),
+            vault_out.from_arcis(new_total_locked),
+        )
+    }
 }
