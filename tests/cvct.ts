@@ -1,226 +1,276 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { PublicKey } from "@solana/web3.js";
-import { Cvct } from "../target/types/cvct";
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  createMint,
+  getAssociatedTokenAddress,
+} from "@solana/spl-token";
 import { randomBytes } from "crypto";
 import {
   awaitComputationFinalization,
-  getArciumEnv,
-  getCompDefAccOffset,
-  getArciumAccountBaseSeed,
-  getArciumProgramId,
-  uploadCircuit,
   buildFinalizeCompDefTx,
-  RescueCipher,
   deserializeLE,
-  getMXEPublicKey,
+  getArciumAccountBaseSeed,
+  getArciumEnv,
+  getArciumProgramId,
+  getClusterAccAddress,
+  getCompDefAccAddress,
+  getCompDefAccOffset,
+  getComputationAccAddress,
+  getExecutingPoolAccAddress,
   getMXEAccAddress,
   getMempoolAccAddress,
-  getCompDefAccAddress,
-  getExecutingPoolAccAddress,
-  getComputationAccAddress,
-  getClusterAccAddress,
   x25519,
 } from "@arcium-hq/client";
-import * as fs from "fs";
-import * as os from "os";
-import { expect } from "chai";
+import { Cvct } from "../target/types/cvct";
+
+// Confidential circuit name compiled in encrypted-ixs.
+const COMP_DEF_NAME = "init_mint_state";
+
+// Helper: produce a random 128-bit nonce as both bytes and BN.
+function randomNonce(): { bytes: Uint8Array; bn: anchor.BN } {
+  const bytes = randomBytes(16);
+  return {
+    bytes,
+    bn: new anchor.BN(deserializeLE(bytes).toString()),
+  };
+}
 
 describe("Cvct", () => {
-  // Configure the client to use the local cluster.
-  anchor.setProvider(anchor.AnchorProvider.env());
-  const program = anchor.workspace
-    .Cvct as Program<Cvct>;
-  const provider = anchor.getProvider();
+  // Explicit local RPC connection avoids env/provider issues under `arcium test`.
+  const connection = new anchor.web3.Connection("http://127.0.0.1:8899", {
+    commitment: "confirmed",
+    disableRetryOnRateLimit: true,
+  });
+  // Use local wallet keypair for signing.
+  const wallet = anchor.Wallet.local();
+  // Anchor provider with confirmed commitment for deterministic results.
+  const provider = new anchor.AnchorProvider(connection, wallet, {
+    commitment: "confirmed",
+    preflightCommitment: "confirmed",
+  });
+  anchor.setProvider(provider);
+  const program = anchor.workspace.Cvct as Program<Cvct>;
 
-  type Event = anchor.IdlEvents<(typeof program)["idl"]>;
-  const awaitEvent = async <E extends keyof Event>(
-    eventName: E,
-  ): Promise<Event[E]> => {
-    let listenerId: number;
-    const event = await new Promise<Event[E]>((res) => {
-      listenerId = program.addEventListener(eventName, (event) => {
-        res(event);
-      });
-    });
-    await program.removeEventListener(listenerId);
+  it("initializes cvct mint", async () => {
+    const payer = provider.wallet as anchor.Wallet;
 
-    return event;
-  };
+    // Give Arcium nodes a moment to finish booting before first RPC.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    console.log("Initializing init_mint_state comp def");
+    await initMintStateCompDef(program, payer);
+    console.log("Comp def initialized");
 
-  const arciumEnv = getArciumEnv();
-  const clusterAccount = getClusterAccAddress(arciumEnv.arciumClusterOffset);
-
-  it("Is initialized!", async () => {
-    const owner = readKpJson(`${os.homedir()}/.config/solana/id.json`);
-
-    console.log("Initializing add together computation definition");
-    const initATSig = await initAddTogetherCompDef(
-      program,
-      owner,
-      false,
-      false,
-    );
-    console.log(
-      "Add together computation definition initialized with signature",
-      initATSig,
+    // Backing SPL mint the CVCT mint will wrap.
+    const backingMint = await createMint(
+      provider.connection,
+      payer.payer,
+      payer.publicKey,
+      null,
+      6,
     );
 
-    const mxePublicKey = await getMXEPublicKeyWithRetry(
-      provider as anchor.AnchorProvider,
+    // CVCT mint PDA (one mint per authority).
+    const [cvctMintPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("cvct_mint"), payer.publicKey.toBuffer()],
       program.programId,
     );
 
-    console.log("MXE x25519 pubkey is", mxePublicKey);
+    // Vault PDA holds the backing SPL tokens.
+    const [vaultPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("vault"), cvctMintPda.toBuffer()],
+      program.programId,
+    );
 
-    const privateKey = x25519.utils.randomSecretKey();
-    const publicKey = x25519.getPublicKey(privateKey);
+    // Vault ATA for the backing mint (owned by vault PDA).
+    const vaultTokenAccount = await getAssociatedTokenAddress(
+      backingMint,
+      vaultPda,
+      true,
+    );
 
-    const sharedSecret = x25519.getSharedSecret(privateKey, mxePublicKey);
-    const cipher = new RescueCipher(sharedSecret);
+    // Arcium cluster offset and computation identifier.
+    const arciumEnv = getArciumEnv();
+    const computationOffset = new anchor.BN(randomBytes(8));
 
-    const val1 = BigInt(1);
-    const val2 = BigInt(2);
-    const plaintext = [val1, val2];
+    // Authority encryption inputs used to produce encrypted totals.
+    const authorityKey = x25519.utils.randomSecretKey();
+    const authorityPubkey = x25519.getPublicKey(authorityKey);
+    const authorityNonce = randomNonce();
+    const vaultNonce = randomNonce();
 
-    const nonce = randomBytes(16);
-    const ciphertext = cipher.encrypt(plaintext, nonce);
+    // Arcium program + fee/clock PDAs used by queue_computation.
+    const arciumProgramId = getArciumProgramId();
+    const [poolAccount] = PublicKey.findProgramAddressSync(
+      [Buffer.from("FeePool")],
+      arciumProgramId,
+    );
+    const [clockAccount] = PublicKey.findProgramAddressSync(
+      [Buffer.from("ClockAccount")],
+      arciumProgramId,
+    );
 
-    const sumEventPromise = awaitEvent("sumEvent");
-    const computationOffset = new anchor.BN(randomBytes(8), "hex");
+    // Comp def PDA is derived from the circuit name.
+    const compDefOffset = getCompDefAccOffset(COMP_DEF_NAME);
 
-    const queueSig = await program.methods
-      .addTogether(
-        computationOffset,
-        Array.from(ciphertext[0]),
-        Array.from(ciphertext[1]),
-        Array.from(publicKey),
-        new anchor.BN(deserializeLE(nonce).toString()),
-      )
-      .accountsPartial({
-        computationAccount: getComputationAccAddress(
-          arciumEnv.arciumClusterOffset,
+    console.log("Queuing init_mint_state computation");
+    await rpcWithLogs(
+      program.methods
+        .initializeCvctMint(
           computationOffset,
-        ),
-        clusterAccount,
-        mxeAccount: getMXEAccAddress(program.programId),
-        mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(
-          arciumEnv.arciumClusterOffset,
-        ),
-        compDefAccount: getCompDefAccAddress(
-          program.programId,
-          Buffer.from(getCompDefAccOffset("add_together")).readUInt32LE(),
-        ),
-      })
-      .rpc({ skipPreflight: true, commitment: "confirmed" });
-    console.log("Queue sig is ", queueSig);
+          Array.from(authorityPubkey),
+          authorityNonce.bn,
+          vaultNonce.bn,
+        )
+        .accountsPartial({
+          authority: payer.publicKey,
+          cvctMint: cvctMintPda,
+          vault: vaultPda,
+          backingMint,
+          vaultTokenAccount,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          mxeAccount: getMXEAccAddress(program.programId),
+          mempoolAccount: getMempoolAccAddress(arciumEnv.arciumClusterOffset),
+          executingPool: getExecutingPoolAccAddress(
+            arciumEnv.arciumClusterOffset,
+          ),
+          computationAccount: getComputationAccAddress(
+            arciumEnv.arciumClusterOffset,
+            computationOffset,
+          ),
+          compDefAccount: getCompDefAccAddress(
+            program.programId,
+            Buffer.from(compDefOffset).readUInt32LE(),
+          ),
+          clusterAccount: getClusterAccAddress(arciumEnv.arciumClusterOffset),
+          poolAccount,
+          clockAccount,
+          arciumProgram: arciumProgramId,
+        })
+        .rpc({ skipPreflight: true, commitment: "confirmed" }),
+      "initializeCvctMint",
+      provider.connection,
+    );
 
-    const finalizeSig = await awaitComputationFinalization(
-      provider as anchor.AnchorProvider,
+    // Wait for Arcium to finalize and deliver the callback.
+    await awaitComputationFinalization(
+      provider,
       computationOffset,
       program.programId,
       "confirmed",
     );
-    console.log("Finalize sig is ", finalizeSig);
 
-    const sumEvent = await sumEventPromise;
-    const decrypted = cipher.decrypt([sumEvent.sum], sumEvent.nonce)[0];
-    expect(decrypted).to.equal(val1 + val2);
+    // Fetch and print on-chain state after callback.
+    const cvctMint = await program.account.cvctMint.fetch(cvctMintPda);
+    const vault = await program.account.vault.fetch(vaultPda);
+    console.log("cvct_mint", cvctMint);
+    console.log("vault", vault);
   });
-
-  async function initAddTogetherCompDef(
-    program: Program<Cvct>,
-    owner: anchor.web3.Keypair,
-    uploadRawCircuit: boolean,
-    offchainSource: boolean,
-  ): Promise<string> {
-    const baseSeedCompDefAcc = getArciumAccountBaseSeed(
-      "ComputationDefinitionAccount",
-    );
-    const offset = getCompDefAccOffset("add_together");
-
-    const compDefPDA = PublicKey.findProgramAddressSync(
-      [baseSeedCompDefAcc, program.programId.toBuffer(), offset],
-      getArciumProgramId(),
-    )[0];
-
-    console.log("Comp def pda is ", compDefPDA);
-
-    const sig = await program.methods
-      .initAddTogetherCompDef()
-      .accounts({
-        compDefAccount: compDefPDA,
-        payer: owner.publicKey,
-        mxeAccount: getMXEAccAddress(program.programId),
-      })
-      .signers([owner])
-      .rpc({
-        commitment: "confirmed",
-      });
-    console.log("Init add together computation definition transaction", sig);
-
-    if (uploadRawCircuit) {
-      const rawCircuit = fs.readFileSync("build/add_together.arcis");
-
-      await uploadCircuit(
-        provider as anchor.AnchorProvider,
-        "add_together",
-        program.programId,
-        rawCircuit,
-        true,
-      );
-    } else if (!offchainSource) {
-      const finalizeTx = await buildFinalizeCompDefTx(
-        provider as anchor.AnchorProvider,
-        Buffer.from(offset).readUInt32LE(),
-        program.programId,
-      );
-
-      const latestBlockhash = await provider.connection.getLatestBlockhash();
-      finalizeTx.recentBlockhash = latestBlockhash.blockhash;
-      finalizeTx.lastValidBlockHeight = latestBlockhash.lastValidBlockHeight;
-
-      finalizeTx.sign(owner);
-
-      await provider.sendAndConfirm(finalizeTx);
-    }
-    return sig;
-  }
 });
 
-async function getMXEPublicKeyWithRetry(
-  provider: anchor.AnchorProvider,
-  programId: PublicKey,
-  maxRetries: number = 20,
-  retryDelayMs: number = 500,
-): Promise<Uint8Array> {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const mxePublicKey = await getMXEPublicKey(provider, programId);
-      if (mxePublicKey) {
-        return mxePublicKey;
-      }
-    } catch (error) {
-      console.log(`Attempt ${attempt} failed to fetch MXE public key:`, error);
-    }
+async function initMintStateCompDef(
+  program: Program<Cvct>,
+  payer: anchor.Wallet,
+): Promise<void> {
+  // Compute PDA for computation definition account.
+  const baseSeedCompDefAcc = getArciumAccountBaseSeed(
+    "ComputationDefinitionAccount",
+  );
+  const offset = getCompDefAccOffset(COMP_DEF_NAME);
 
-    if (attempt < maxRetries) {
-      console.log(
-        `Retrying in ${retryDelayMs}ms... (attempt ${attempt}/${maxRetries})`,
-      );
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-    }
-  }
+  const compDefPDA = PublicKey.findProgramAddressSync(
+    [baseSeedCompDefAcc, program.programId.toBuffer(), offset],
+    getArciumProgramId(),
+  )[0];
 
-  throw new Error(
-    `Failed to fetch MXE public key after ${maxRetries} attempts`,
+  // Initialize comp def on-chain (required once per circuit).
+  await rpcWithLogs(
+    program.methods
+      .initMintStateCompDef()
+      .accountsPartial({
+        compDefAccount: compDefPDA,
+        payer: payer.publicKey,
+        mxeAccount: getMXEAccAddress(program.programId),
+        arciumProgram: getArciumProgramId(),
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([payer.payer])
+      .rpc({
+        commitment: "confirmed",
+      }),
+    "initMintStateCompDef",
+    program.provider.connection,
+  );
+
+  // Finalize comp def (registers compiled circuit).
+  const finalizeTx = await buildFinalizeCompDefTx(
+    program.provider as anchor.AnchorProvider,
+    Buffer.from(offset).readUInt32LE(),
+    program.programId,
+  );
+
+  // Retry blockhash fetch to handle early localnet startup.
+  const latestBlockhash = await getLatestBlockhashWithRetry(
+    program.provider.connection,
+  );
+  finalizeTx.recentBlockhash = latestBlockhash.blockhash;
+  finalizeTx.lastValidBlockHeight = latestBlockhash.lastValidBlockHeight;
+
+  finalizeTx.sign(payer.payer);
+
+  await rpcWithLogs(
+    program.provider.sendAndConfirm(finalizeTx),
+    "finalizeCompDef",
+    program.provider.connection,
   );
 }
 
-function readKpJson(path: string): anchor.web3.Keypair {
-  const file = fs.readFileSync(path);
-  return anchor.web3.Keypair.fromSecretKey(
-    new Uint8Array(JSON.parse(file.toString())),
-  );
+// Simple retry for blockhash fetch (localnet may lag during boot).
+async function getLatestBlockhashWithRetry(
+  connection: anchor.web3.Connection,
+  retries = 10,
+  delayMs = 500,
+) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await connection.getLatestBlockhash("confirmed");
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw new Error("unreachable");
+}
+
+// Helper to surface logs on transaction failure for faster debugging.
+async function rpcWithLogs<T>(
+  promise: Promise<T>,
+  label: string,
+  connection: anchor.web3.Connection,
+): Promise<T> {
+  try {
+    return await promise;
+  } catch (err) {
+    const maybeLogs =
+      (err as { logs?: string[] }).logs ||
+      (err as { transactionError?: { logs?: string[] } }).transactionError
+        ?.logs;
+    if (maybeLogs) {
+      console.error(`${label} logs:`, maybeLogs);
+    } else if (
+      err instanceof anchor.web3.SendTransactionError &&
+      typeof (err as { getLogs?: (c: anchor.web3.Connection) => Promise<string[]> })
+        .getLogs === "function"
+    ) {
+      const logs = await (err as { getLogs: (c: anchor.web3.Connection) => Promise<string[]> }).getLogs(
+        connection,
+      );
+      console.error(`${label} logs:`, logs);
+    }
+    throw err;
+  }
 }

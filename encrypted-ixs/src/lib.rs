@@ -4,15 +4,17 @@ use arcis::*;
 mod circuits {
     use arcis::*;
 
-    pub struct InputValues {
-        v1: u8,
-        v2: u8,
-    }
-
     #[instruction]
-    pub fn add_together(input_ctxt: Enc<Shared, InputValues>) -> Enc<Shared, u16> {
-        let input = input_ctxt.to_arcis();
-        let sum = input.v1 as u16 + input.v2 as u16;
-        input_ctxt.owner.from_arcis(sum)
+    pub fn init_mint_state(
+        authority: Shared,
+        vault: Shared,
+    ) -> (Enc<Shared, u128>, Enc<Shared, u128>) {
+        // This circuit initializes encrypted zero values for mint totals.
+        // The `Shared` inputs represent public-key + nonce pairs supplied by the client.
+        // Each `from_arcis(0)` produces an encrypted u128 under that input's key.
+        (
+            authority.from_arcis(0u128),
+            vault.from_arcis(0u128),
+        )
     }
 }
