@@ -263,12 +263,13 @@ async function rpcWithLogs<T>(
       console.error(`${label} logs:`, maybeLogs);
     } else if (
       err instanceof anchor.web3.SendTransactionError &&
+      "getLogs" in (err as unknown as { getLogs?: unknown }) &&
       typeof (err as { getLogs?: (c: anchor.web3.Connection) => Promise<string[]> })
         .getLogs === "function"
     ) {
-      const logs = await (err as { getLogs: (c: anchor.web3.Connection) => Promise<string[]> }).getLogs(
-        connection,
-      );
+      const logs = await (err as unknown as {
+        getLogs: (c: anchor.web3.Connection) => Promise<string[]>;
+      }).getLogs(connection);
       console.error(`${label} logs:`, logs);
     }
     throw err;
