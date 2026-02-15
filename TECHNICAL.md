@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Primitive Confidential Vault‑Backed Accounts (CVCT)
 
 ## Abstract
@@ -32,23 +33,33 @@ Existing privacy systems are powerful but heavy: they require custom circuits, s
 * small enough to audit,
 * flexible enough to compose,
 * opinionated only where necessary.
+=======
+# CVCT Technical Overview (Arcium)
+
+## Abstract
+
+CVCT is a confidential accounting layer for Solana. It keeps balances, mint totals, and internal transfers private while preserving full on‑chain custody through SPL token vaults. This branch uses **Arcium** as an MPC co‑processor: encrypted values are updated off‑chain and written back on‑chain via authenticated callbacks.
+>>>>>>> cvct_arcium
 
 ---
 
 ## Design Goals
 
-1. **Minimalism** — keep the on‑chain surface small and auditable.
-2. **Composability** — usable as a building block by unrelated programs.
-3. **Confidential State** — balances and internal accounting are not publicly readable.
-4. **Deterministic Enforcement** — no trust in off‑chain actors for correctness.
-5. **Upgradeable Privacy** — support stronger cryptography without redesigning interfaces.
+1. **Confidentiality** — balances and internal flows are not revealed on‑chain.
+1. **Auditability** — custody is public and verifiable via vault balances.
+1. **Composability** — designed as a primitive for payroll, DAOs, and DeFi.
+1. **Minimal Surface** — keep on‑chain logic small, deterministic, and auditable.
 
 ---
 
-## Core Concept
+## Architecture
 
-A **Confidential Vault‑Backed Account** is composed of:
+### On‑chain
+1. **Vault PDA**: holds backing SPL tokens.
+1. **CvctMint**: metadata + encrypted `total_supply`.
+1. **CvctAccount**: per‑user encrypted `balance`.
 
+<<<<<<< HEAD
 1. **Vault PDA**
    Holds real assets (SOL or SPL tokens). This account is fully on‑chain and auditable.
 
@@ -106,19 +117,37 @@ ConfidentialAccount {
   nonce: u64,
 }
 ```
+=======
+### Off‑chain (Arcium MPC)
+Arcis circuits define the encrypted transitions. The program queues computations and only stores the resulting ciphertexts + nonces.
+>>>>>>> cvct_arcium
 
 ---
 
 ## State Transitions
 
-### Deposit
+### Initialize Mint
+1. Create `CvctMint` and `Vault`.
+1. Queue `init_mint_state` circuit.
+1. Callback writes encrypted zero totals.
 
+<<<<<<< HEAD
 * User transfers assets into the vault
 * Program updates encrypted balance, total supply, and total locked via CPI
 * No plaintext balances are revealed on‑chain
+=======
+### Initialize Account
+1. Create `CvctAccount`.
+1. Queue `init_account_state`.
+1. Callback writes encrypted zero balance.
+>>>>>>> cvct_arcium
 
-### Withdrawal
+### Deposit and Mint
+1. SPL transfer: user → vault.
+1. Queue `deposit_and_mint`.
+1. Callback writes updated encrypted balance, supply, and locked totals.
 
+<<<<<<< HEAD
 * Program validates encrypted decrement via CPI
 * Assets are released from the vault
 * Public observers see only the vault movement, not internal balances
@@ -127,11 +156,23 @@ ConfidentialAccount {
 
 * Two confidential accounts update encrypted balances atomically
 * Vault balance remains unchanged
+=======
+### Burn and Withdraw
+1. Queue `burn_and_withdraw`.
+1. Circuit checks `balance >= amount` and returns `ok`.
+1. Callback writes updated encrypted state, then transfers SPL vault → user if `ok`.
+
+### Transfer
+1. Queue `transfer_cvct`.
+1. Circuit updates sender/recipient encrypted balances and returns `ok`.
+1. Callback writes updated encrypted balances.
+>>>>>>> cvct_arcium
 
 ---
 
 ## Confidentiality Model
 
+<<<<<<< HEAD
 PCVBAs **do not rely on secrecy of code or validators**.
 
 Confidentiality is achieved by:
@@ -143,11 +184,17 @@ INCO Lightning provides:
 * `as_euint128` for encryption of plaintext inputs
 * `e_add`, `e_sub`, `e_ge`, `e_select` for encrypted arithmetic and comparisons
 * `allow` to grant account owners decryption access to their balances
+=======
+1. Ciphertexts and nonces are stored on‑chain.
+1. MPC runs on secret‑shared values and returns authenticated ciphertexts.
+1. No plaintext balances or transfer amounts are revealed on‑chain.
+>>>>>>> cvct_arcium
 
 ---
 
 ## Security Invariants
 
+<<<<<<< HEAD
 The program enforces:
 
 1. **Conservation of Value**
@@ -161,30 +208,34 @@ The program enforces:
 
 4. **Atomicity**
    Multi‑party transitions either fully succeed or fail
+=======
+1. **Custody is public**: vault balances are always auditable.
+1. **No inflation**: total_supply is only updated through MPC transitions.
+1. **Authorization**: Anchor constraints gate who can update state.
+1. **Atomicity**: each transition is written in a single callback.
+>>>>>>> cvct_arcium
 
 ---
 
-## Threat Model
+## Why MPC (Arcium)
 
-### Out of Scope
-
-* Validator collusion
-* Chain‑level censorship
-* Side‑channel attacks outside Solana
-
-### In Scope
-
-* Malicious users
-* Invalid state transitions
-* Unauthorized withdrawals
-* Balance inflation attempts
+Arcium removes the need to embed cryptographic arithmetic directly on‑chain while preserving:
+1. Deterministic verification of outputs.
+1. Confidential state updates.
+1. A clean interface for future ZK or multi‑party extensions.
 
 ---
 
-## Why This Is a Primitive (Not a Product)
+## Tests
 
-PCVBAs intentionally avoid:
+The test suite:
+1. Initializes mint + accounts.
+1. Deposits and mints.
+1. Burns and withdraws.
+1. Transfers between accounts.
+1. Decrypts ciphertexts client‑side to verify correctness in cleartext.
 
+<<<<<<< HEAD
 * UI assumptions
 * identity systems
 * compliance logic
@@ -263,3 +314,5 @@ This primitive is intended to be **built upon**, not locked into a single applic
 ---
 
 **Migration note:** We are moving the confidential computation layer from **INCO Lightning** to **Arcium** to address the current `burn_and_withdraw` edge case and improve MPC‑style workflows going forward.
+=======
+>>>>>>> cvct_arcium

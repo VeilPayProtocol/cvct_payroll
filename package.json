@@ -5,11 +5,14 @@
     "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check"
   },
   "dependencies": {
-    "@arcium-hq/client": "0.6.4",
-    "@coral-xyz/anchor": "^0.31.1",
-    "@inco/solana-sdk": "^0.0.2",
-    "@solana/spl-token": "^0.4.9",
-    "tweetnacl": "^1.0.3"
+    "@arcium-hq/client": "0.6.5",
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "1.73.3",
+    "rpc-websockets": "7.7.0"
+  },
+  "resolutions": {
+    "@solana/web3.js": "1.73.3"
   },
   "devDependencies": {
     "@types/bn.js": "^5.1.0",
