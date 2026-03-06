@@ -29,6 +29,7 @@ declare_id!("B4rLKdnQsFH2e4CBefgWsBXZ7xsX4ewb7QUiMim4Nbvj");
 const STATUS_REQUESTED: u8 = OperationStatus::Requested as u8;
 const STATUS_COMPUTED_SUCCESS: u8 = OperationStatus::ComputedSuccess as u8;
 const STATUS_COMPUTED_FAILURE: u8 = OperationStatus::ComputedFailure as u8;
+const STATUS_INVALIDATED: u8 = OperationStatus::Invalidated as u8;
 
 #[arcium_program]
 pub mod cvct {
@@ -101,6 +102,10 @@ pub mod cvct {
                 backing_token_account: vault_token_account_key,
                 total_locked: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
                 total_locked_nonce: 0,
+            });
+            ctx.accounts.pricing_state.set_inner(PricingState {
+                cvct_mint: cvct_mint_key,
+                pricing_version: 0,
             });
         }
 
@@ -272,6 +277,7 @@ pub mod cvct {
         require!(quoted_shares_out >= min_shares_out, ErrorCode::InvalidAmount);
 
         let pending_op = &mut ctx.accounts.pending_operation;
+        let base_pricing_version = ctx.accounts.pricing_state.pricing_version;
         pending_op.set_inner(PendingOperation {
             operation_id,
             cvct_mint: ctx.accounts.cvct_mint.key(),
@@ -287,6 +293,7 @@ pub mod cvct {
             min_amount_out: min_shares_out,
             amount_out: 0,
             deadline_slot,
+            base_pricing_version,
         });
         let pending_result = &mut ctx.accounts.pending_deposit_result;
         pending_result.set_inner(PendingDepositResult {
@@ -303,6 +310,7 @@ pub mod cvct {
             shares_out: 0,
             computed_at_slot: 0,
             callback_applied: false,
+            base_pricing_version,
         });
         emit!(OperationRequestedEvent {
             operation_id,
@@ -376,6 +384,10 @@ pub mod cvct {
                         is_writable: true,
                     },
                     CallbackAccount {
+                        pubkey: ctx.accounts.pricing_state.key(),
+                        is_writable: true,
+                    },
+                    CallbackAccount {
                         pubkey: ctx.accounts.vault.key(),
                         is_writable: true,
                     },
@@ -438,6 +450,27 @@ pub mod cvct {
             pending_result.user == pending_op.user,
             ErrorCode::InvalidPendingOperation
         );
+        if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
+            || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
+        {
+            let computed_at_slot = Clock::get()?.slot;
+            pending_result.ok = false;
+            pending_result.shares_out = 0;
+            pending_result.computed_at_slot = computed_at_slot;
+            pending_result.callback_applied = true;
+            pending_op.ok = false;
+            pending_op.amount_out = 0;
+            pending_op.callback_applied = true;
+            pending_op.computed_at_slot = computed_at_slot;
+            pending_op.status = STATUS_INVALIDATED;
+            emit!(OperationSettledEvent {
+                operation_id: pending_op.operation_id,
+                kind: pending_op.kind,
+                final_status: pending_op.status,
+                amount_out: 0,
+            });
+            return Ok(());
+        }
         pending_result.balance = balance.ciphertexts;
         pending_result.balance_nonce = balance.nonce;
         pending_result.total_supply = total_supply.ciphertexts;
@@ -513,6 +546,18 @@ pub mod cvct {
             pending_result.computed_at_slot == pending_op.computed_at_slot,
             ErrorCode::InvalidPendingOperation
         );
+        if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
+            || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
+        {
+            pending_op.status = STATUS_INVALIDATED;
+            emit!(OperationSettledEvent {
+                operation_id: pending_op.operation_id,
+                kind: pending_op.kind,
+                final_status: pending_op.status,
+                amount_out: 0,
+            });
+            return Ok(());
+        }
 
         if !pending_op.ok {
             pending_op.status = OperationStatus::Failed as u8;
@@ -549,6 +594,12 @@ pub mod cvct {
         vault.total_locked_nonce = pending_result.total_locked_nonce;
 
         pending_op.status = OperationStatus::Settled as u8;
+        ctx.accounts.pricing_state.pricing_version = ctx
+            .accounts
+            .pricing_state
+            .pricing_version
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidAmount)?;
         emit!(OperationSettledEvent {
             operation_id: pending_op.operation_id,
             kind: pending_op.kind,
@@ -631,6 +682,7 @@ pub mod cvct {
         );
 
         let pending_op = &mut ctx.accounts.pending_operation;
+        let base_pricing_version = ctx.accounts.pricing_state.pricing_version;
         pending_op.set_inner(PendingOperation {
             operation_id,
             cvct_mint: ctx.accounts.cvct_mint.key(),
@@ -646,6 +698,7 @@ pub mod cvct {
             min_amount_out: 0,
             amount_out: 0,
             deadline_slot: 0,
+            base_pricing_version,
         });
         let pending_result = &mut ctx.accounts.pending_redeem_result;
         pending_result.set_inner(PendingRedeemResult {
@@ -662,6 +715,7 @@ pub mod cvct {
             assets_out: 0,
             computed_at_slot: 0,
             callback_applied: false,
+            base_pricing_version,
         });
         emit!(OperationRequestedEvent {
             operation_id,
@@ -731,6 +785,10 @@ pub mod cvct {
                         is_writable: true,
                     },
                     CallbackAccount {
+                        pubkey: ctx.accounts.pricing_state.key(),
+                        is_writable: true,
+                    },
+                    CallbackAccount {
                         pubkey: ctx.accounts.vault.key(),
                         is_writable: true,
                     },
@@ -792,6 +850,27 @@ pub mod cvct {
             pending_result.user == pending_op.user,
             ErrorCode::InvalidPendingOperation
         );
+        if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
+            || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
+        {
+            let computed_at_slot = Clock::get()?.slot;
+            pending_result.ok = false;
+            pending_result.assets_out = 0;
+            pending_result.computed_at_slot = computed_at_slot;
+            pending_result.callback_applied = true;
+            pending_op.ok = false;
+            pending_op.amount_out = 0;
+            pending_op.callback_applied = true;
+            pending_op.computed_at_slot = computed_at_slot;
+            pending_op.status = STATUS_INVALIDATED;
+            emit!(OperationSettledEvent {
+                operation_id: pending_op.operation_id,
+                kind: pending_op.kind,
+                final_status: pending_op.status,
+                amount_out: 0,
+            });
+            return Ok(());
+        }
         pending_result.balance = balance.ciphertexts;
         pending_result.balance_nonce = balance.nonce;
         pending_result.total_supply = total_supply.ciphertexts;
@@ -867,6 +946,18 @@ pub mod cvct {
             pending_result.computed_at_slot == pending_op.computed_at_slot,
             ErrorCode::InvalidPendingOperation
         );
+        if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
+            || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
+        {
+            pending_op.status = STATUS_INVALIDATED;
+            emit!(OperationSettledEvent {
+                operation_id: pending_op.operation_id,
+                kind: pending_op.kind,
+                final_status: pending_op.status,
+                amount_out: 0,
+            });
+            return Ok(());
+        }
         if !pending_op.ok {
             pending_op.status = OperationStatus::Failed as u8;
             emit!(OperationSettledEvent {
@@ -912,6 +1003,12 @@ pub mod cvct {
         vault.total_locked_nonce = pending_result.total_locked_nonce;
 
         pending_op.status = OperationStatus::Settled as u8;
+        ctx.accounts.pricing_state.pricing_version = ctx
+            .accounts
+            .pricing_state
+            .pricing_version
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidAmount)?;
         emit!(OperationSettledEvent {
             operation_id: pending_op.operation_id,
             kind: pending_op.kind,
@@ -1106,6 +1203,12 @@ pub mod cvct {
         let vault = &mut ctx.accounts.vault;
         vault.total_locked = [total_locked_ciphertext];
         vault.total_locked_nonce = total_locked_nonce;
+        ctx.accounts.pricing_state.pricing_version = ctx
+            .accounts
+            .pricing_state
+            .pricing_version
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidAmount)?;
 
         Ok(())
     }
@@ -1118,6 +1221,12 @@ pub mod cvct {
         let vault = &mut ctx.accounts.vault;
         vault.total_locked = [total_locked_ciphertext];
         vault.total_locked_nonce = total_locked_nonce;
+        ctx.accounts.pricing_state.pricing_version = ctx
+            .accounts
+            .pricing_state
+            .pricing_version
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidAmount)?;
         Ok(())
     }
 
@@ -1256,6 +1365,16 @@ impl Vault {
 }
 
 #[account]
+pub struct PricingState {
+    pub cvct_mint: Pubkey,
+    pub pricing_version: u64,
+}
+
+impl PricingState {
+    pub const LEN: usize = 32 + 8;
+}
+
+#[account]
 pub struct CvctAccount {
     pub owner: Pubkey,
     pub cvct_mint: Pubkey,
@@ -1287,6 +1406,7 @@ pub enum OperationStatus {
     Failed = 5,
     Cancelled = 6,
     Expired = 7,
+    Invalidated = 8,
 }
 
 #[account]
@@ -1309,10 +1429,11 @@ pub struct PendingOperation {
     pub amount_out: u64,
     /// Deadline slot for deposits, zero for redeems.
     pub deadline_slot: u64,
+    pub base_pricing_version: u64,
 }
 
 impl PendingOperation {
-    pub const LEN: usize = 8 + (32 * 4) + 1 + 1 + 1 + 8 + 1 + 8 + 8 + 8 + 8;
+    pub const LEN: usize = 8 + (32 * 4) + 1 + 1 + 1 + 8 + 1 + 8 + 8 + 8 + 8 + 8;
 }
 
 #[account]
@@ -1330,11 +1451,12 @@ pub struct PendingDepositResult {
     pub shares_out: u64,
     pub computed_at_slot: u64,
     pub callback_applied: bool,
+    pub base_pricing_version: u64,
 }
 
 impl PendingDepositResult {
     pub const LEN: usize =
-        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1;
+        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1 + 8;
 }
 
 #[account]
@@ -1352,11 +1474,12 @@ pub struct PendingRedeemResult {
     pub assets_out: u64,
     pub computed_at_slot: u64,
     pub callback_applied: bool,
+    pub base_pricing_version: u64,
 }
 
 impl PendingRedeemResult {
     pub const LEN: usize =
-        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1;
+        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1 + 8;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -1396,6 +1519,7 @@ fn is_terminal_status(status: u8) -> bool {
         || status == OperationStatus::Failed as u8
         || status == OperationStatus::Cancelled as u8
         || status == OperationStatus::Expired as u8
+        || status == OperationStatus::Invalidated as u8
 }
 
 #[event]
@@ -1495,6 +1619,14 @@ pub struct InitializeCvctMint<'info> {
     )]
     /// Vault metadata (encrypted total locked updated by callback).
     pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + PricingState::LEN,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
     /// SPL mint that backs CVCT.
     pub backing_mint: Account<'info, Mint>,
     #[account(
@@ -1686,6 +1818,13 @@ pub struct RequestDepositIntent<'info> {
     pub cvct_mint: Box<Account<'info, CvctMint>>,
     #[account(
         mut,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+        constraint = pricing_state.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
+    #[account(
+        mut,
         seeds = [b"vault", cvct_mint.key().as_ref()],
         bump,
         constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
@@ -1765,6 +1904,13 @@ pub struct DepositAndMintCallback<'info> {
     #[account(mut)]
     /// CVCT mint to update encrypted total supply.
     pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+        constraint = pricing_state.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
     #[account(
         mut,
         seeds = [b"vault", cvct_mint.key().as_ref()],
@@ -1849,6 +1995,13 @@ pub struct RequestRedeemIntent<'info> {
     pub cvct_mint: Box<Account<'info, CvctMint>>,
     #[account(
         mut,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+        constraint = pricing_state.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
+    #[account(
+        mut,
         seeds = [b"vault", cvct_mint.key().as_ref()],
         bump,
         constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
@@ -1930,6 +2083,13 @@ pub struct BurnAndWithdrawCallback<'info> {
     pub cvct_mint: Box<Account<'info, CvctMint>>,
     #[account(
         mut,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+        constraint = pricing_state.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
+    #[account(
+        mut,
         seeds = [b"vault", cvct_mint.key().as_ref()],
         bump,
     )]
@@ -1960,6 +2120,13 @@ pub struct SettleDepositCommit<'info> {
     pub user: Signer<'info>,
     #[account(mut)]
     pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+        constraint = pricing_state.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
     #[account(
         mut,
         seeds = [b"vault", cvct_mint.key().as_ref()],
@@ -2063,6 +2230,13 @@ pub struct SettleRedeemCommit<'info> {
     pub cvct_mint: Box<Account<'info, CvctMint>>,
     #[account(
         mut,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+        constraint = pricing_state.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
+    #[account(
+        mut,
         seeds = [b"vault", cvct_mint.key().as_ref()],
         bump,
         constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
@@ -2115,6 +2289,13 @@ pub struct SyncTotalAssets<'info> {
         constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
     )]
     pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+        constraint = pricing_state.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
     #[account(
         mut,
         seeds = [b"vault", cvct_mint.key().as_ref()],
@@ -2318,6 +2499,13 @@ pub struct SyncTotalAssetsFromAdapter<'info> {
         constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
     )]
     pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"pricing_state", cvct_mint.key().as_ref()],
+        bump,
+        constraint = pricing_state.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pricing_state: Box<Account<'info, PricingState>>,
     #[account(
         mut,
         seeds = [b"vault", cvct_mint.key().as_ref()],
@@ -2531,6 +2719,8 @@ pub enum ErrorCode {
     CallbackAlreadyApplied,
     #[msg("Math operand out of safe range")]
     MathOperandOutOfRange,
+    #[msg("Operation was computed against a stale pricing version")]
+    StalePricingVersion,
     #[msg("Insufficient idle vault liquidity for redeem settlement")]
     InsufficientIdleLiquidity,
     #[msg("Kamino adapter is disabled")]

@@ -287,6 +287,7 @@ describe("Cvct Kamino Adapter", () => {
       .accountsPartial({
         authority: fixture.authoritySigner.publicKey,
         cvctMint: fixture.cvctMintPda,
+        pricingState: fixture.pricingStatePda,
         vault: fixture.vaultPda,
         kaminoAdapter: kaminoAdapterPda,
       })

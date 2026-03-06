@@ -77,6 +77,7 @@ export type Fixture = {
   authoritySigner: anchor.web3.Keypair;
   backingMint: PublicKey;
   cvctMintPda: PublicKey;
+  pricingStatePda: PublicKey;
   vaultPda: PublicKey;
   vaultTokenAccount: PublicKey;
   userTokenAccount: PublicKey;
@@ -253,6 +254,10 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
     [Buffer.from("vault"), cvctMintPda.toBuffer()],
     harness.program.programId,
   );
+  const [pricingStatePda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pricing_state"), cvctMintPda.toBuffer()],
+    harness.program.programId,
+  );
 
   const vaultTokenAccount = await getAssociatedTokenAddress(
     backingMint,
@@ -285,7 +290,7 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
   const mintCompDefOffset = getCompDefAccOffset(COMP_DEF_MINT);
 
   await rpcWithLogs(
-    harness.program.methods
+    (harness.program.methods as any)
       .initializeCvctMint(
         mintCompOffset,
         Array.from(authorityPubkey),
@@ -299,6 +304,7 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
         authority: authoritySigner.publicKey,
         cvctMint: cvctMintPda,
         vault: vaultPda,
+        pricingState: pricingStatePda,
         backingMint,
         vaultTokenAccount,
         systemProgram: anchor.web3.SystemProgram.programId,
@@ -464,6 +470,7 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
     authoritySigner,
     backingMint,
     cvctMintPda,
+    pricingStatePda,
     vaultPda,
     vaultTokenAccount,
     userTokenAccount: userTokenAccount.address,
@@ -547,6 +554,7 @@ export async function requestDeposit(
       .accountsPartial({
         user: harness.payer.publicKey,
         cvctMint: fixture.cvctMintPda,
+        pricingState: fixture.pricingStatePda,
         vault: fixture.vaultPda,
         cvctAccount: fixture.cvctAccountPda,
         userTokenAccount: fixture.userTokenAccount,
@@ -639,6 +647,7 @@ export async function requestRedeem(
       .accountsPartial({
         user: harness.payer.publicKey,
         cvctMint: fixture.cvctMintPda,
+        pricingState: fixture.pricingStatePda,
         vault: fixture.vaultPda,
         cvctAccount: fixture.cvctAccountPda,
         userTokenAccount: fixture.userTokenAccount,
@@ -684,6 +693,7 @@ export async function finalizeAndSettleDeposit(
       .accountsPartial({
         user: harness.payer.publicKey,
         cvctMint: fixture.cvctMintPda,
+        pricingState: fixture.pricingStatePda,
         vault: fixture.vaultPda,
         pendingOperation: req.operationPda,
         pendingDepositResult: req.depositResultPda,
@@ -711,6 +721,7 @@ export async function finalizeAndSettleRedeem(
       .accountsPartial({
         executor: harness.payer.publicKey,
         cvctMint: fixture.cvctMintPda,
+        pricingState: fixture.pricingStatePda,
         vault: fixture.vaultPda,
         pendingOperation: req.operationPda,
         pendingRedeemResult: req.redeemResultPda,
@@ -861,6 +872,7 @@ export async function syncTotalAssetsNoop(fixture: Fixture): Promise<void> {
       .accountsPartial({
         authority: fixture.authoritySigner.publicKey,
         cvctMint: fixture.cvctMintPda,
+        pricingState: fixture.pricingStatePda,
         vault: fixture.vaultPda,
       })
       .signers([fixture.authoritySigner])
@@ -878,6 +890,13 @@ export async function fetchPendingStatus(
     operationPda,
   );
   return op.status;
+}
+
+export async function fetchPricingVersion(fixture: Fixture): Promise<number> {
+  const pricingState = await (fixture.harness.program.account as any).pricingState.fetch(
+    fixture.pricingStatePda,
+  );
+  return Number(pricingState.pricingVersion);
 }
 
 export async function fetchPendingDepositResult(
@@ -974,6 +993,7 @@ export async function settleDepositCall(
     .accountsPartial({
       user: fixture.harness.payer.publicKey,
       cvctMint: fixture.cvctMintPda,
+      pricingState: fixture.pricingStatePda,
       vault: fixture.vaultPda,
       pendingOperation: operationPda,
       pendingDepositResult: depositResultPda,
@@ -1028,6 +1048,7 @@ export async function settleRedeemCall(
     .accountsPartial({
       executor: fixture.harness.payer.publicKey,
       cvctMint: fixture.cvctMintPda,
+      pricingState: fixture.pricingStatePda,
       vault: fixture.vaultPda,
       pendingOperation: operationPda,
       pendingRedeemResult: redeemResultPda,
