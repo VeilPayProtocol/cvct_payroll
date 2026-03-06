@@ -12,8 +12,13 @@ const COMP_DEF_OFFSET_DEPOSIT_AND_MINT: u32 = comp_def_offset("deposit_and_mint"
 const COMP_DEF_OFFSET_BURN_AND_WITHDRAW: u32 = comp_def_offset("burn_and_withdraw");
 const COMP_DEF_OFFSET_TRANSFER_CVCT: u32 = comp_def_offset("transfer_cvct");
 const ENCRYPTED_U128_CIPHERTEXTS: usize = 1;
+const MAX_SAFE_OPERAND_U64: u64 = u64::MAX - 1;
 
 declare_id!("B4rLKdnQsFH2e4CBefgWsBXZ7xsX4ewb7QUiMim4Nbvj");
+
+const STATUS_REQUESTED: u8 = OperationStatus::Requested as u8;
+const STATUS_COMPUTED_SUCCESS: u8 = OperationStatus::ComputedSuccess as u8;
+const STATUS_COMPUTED_FAILURE: u8 = OperationStatus::ComputedFailure as u8;
 
 #[arcium_program]
 pub mod cvct {
@@ -227,10 +232,12 @@ pub mod cvct {
 
         Ok(())
     }
-    pub fn deposit_and_mint(
-        ctx: Context<DepositAndMint>,
+    pub fn request_deposit(
+        ctx: Context<RequestDeposit>,
         computation_offset: u64,
-        amount: u64,
+        operation_id: u64,
+        assets_in: u64,
+        quoted_shares_out: u64,
         owner_enc_pubkey: [u8; 32],
         owner_balance_nonce: u128,
         owner_new_balance_nonce: u128,
@@ -241,9 +248,16 @@ pub mod cvct {
         vault_total_locked_nonce: u128,
         vault_new_total_locked_nonce: u128,
     ) -> Result<()> {
-        require!(amount > 0, ErrorCode::ZeroAmount);
+        require!(assets_in > 0, ErrorCode::ZeroAmount);
+        require!(quoted_shares_out > 0, ErrorCode::ZeroAmount);
+        require!(
+            assets_in <= MAX_SAFE_OPERAND_U64 && quoted_shares_out <= MAX_SAFE_OPERAND_U64,
+            ErrorCode::MathOperandOutOfRange
+        );
 
-        // 1) Transfer backing tokens into the vault.
+        // 1) Transfer backing tokens into the vault first.
+        //    Deposit share math (including inflation-attack defenses) is evaluated
+        //    in MPC and returned asynchronously in the callback.
         transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -253,10 +267,34 @@ pub mod cvct {
                     authority: ctx.accounts.user.to_account_info(),
                 },
             ),
-            amount,
+            assets_in,
         )?;
 
-        // 2) Build Arcium args: read encrypted balance/supply/locked from accounts, add amount.
+        let pending_op = &mut ctx.accounts.pending_operation;
+        pending_op.set_inner(PendingOperation {
+            operation_id,
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            user: ctx.accounts.user.key(),
+            user_token_account: ctx.accounts.user_token_account.key(),
+            vault_token_account: ctx.accounts.vault_token_account.key(),
+            kind: OperationKind::Deposit as u8,
+            status: STATUS_REQUESTED,
+            callback_applied: false,
+            computed_at_slot: 0,
+            ok: false,
+            amount_in: assets_in,
+            amount_out: 0,
+        });
+        emit!(OperationRequestedEvent {
+            operation_id,
+            kind: OperationKind::Deposit as u8,
+            user: ctx.accounts.user.key(),
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            amount_in: assets_in,
+        });
+
+        // Queue confidential share mint arithmetic:
+        // shares = floor(assets_in * (supply + VS) / (assets + VA)).
         let args = ArgBuilder::new()
             // Balance input from account data.
             .x25519_pubkey(owner_enc_pubkey)
@@ -267,7 +305,9 @@ pub mod cvct {
                 (32 * ENCRYPTED_U128_CIPHERTEXTS) as u32,
             )
             // Plaintext amount.
-            .plaintext_u128(amount as u128)
+            .plaintext_u128(assets_in as u128)
+            // Caller-provided quote to verify in MPC.
+            .plaintext_u128(quoted_shares_out as u128)
             // Output encryption context for balance.
             .x25519_pubkey(owner_enc_pubkey)
             .plaintext_u128(owner_new_balance_nonce)
@@ -318,6 +358,10 @@ pub mod cvct {
                         pubkey: ctx.accounts.vault.key(),
                         is_writable: true,
                     },
+                    CallbackAccount {
+                        pubkey: ctx.accounts.pending_operation.key(),
+                        is_writable: true,
+                    },
                 ],
             )?],
             1,
@@ -332,7 +376,7 @@ pub mod cvct {
         ctx: Context<DepositAndMintCallback>,
         output: SignedComputationOutputs<DepositAndMintOutput>,
     ) -> Result<()> {
-        let (balance, total_supply, total_locked) = match output.verify_output(
+        let (balance, total_supply, total_locked, ok, shares_out) = match output.verify_output(
             &ctx.accounts.cluster_account,
             &ctx.accounts.computation_account,
         ) {
@@ -342,8 +386,10 @@ pub mod cvct {
                         field_0: balance,
                         field_1: total_supply,
                         field_2: total_locked,
+                        field_3: ok,
+                        field_4: shares_out,
                     },
-            }) => (balance, total_supply, total_locked),
+            }) => (balance, total_supply, total_locked, ok, shares_out),
             Err(_) => return Err(ErrorCode::AbortedComputation.into()),
         };
 
@@ -360,13 +406,93 @@ pub mod cvct {
         vault.total_locked = total_locked.ciphertexts;
         vault.total_locked_nonce = total_locked.nonce;
 
+        let pending_op = &mut ctx.accounts.pending_operation;
+        require!(
+            pending_op.status == STATUS_REQUESTED,
+            ErrorCode::InvalidOperationPhase
+        );
+        require!(!pending_op.callback_applied, ErrorCode::CallbackAlreadyApplied);
+        pending_op.ok = ok;
+        pending_op.amount_out = shares_out
+            .try_into()
+            .map_err(|_| ErrorCode::InvalidAmount)?;
+        pending_op.callback_applied = true;
+        pending_op.computed_at_slot = Clock::get()?.slot;
+        pending_op.status = if ok {
+            STATUS_COMPUTED_SUCCESS
+        } else {
+            STATUS_COMPUTED_FAILURE
+        };
+        emit!(OperationComputedEvent {
+            operation_id: pending_op.operation_id,
+            kind: pending_op.kind,
+            ok: pending_op.ok,
+            amount_out: pending_op.amount_out,
+        });
+
         Ok(())
     }
 
-    pub fn burn_and_withdraw(
-        ctx: Context<BurnAndWithdraw>,
+    pub fn settle_deposit(ctx: Context<SettleDeposit>) -> Result<()> {
+        let pending_op = &mut ctx.accounts.pending_operation;
+        if is_terminal_status(pending_op.status) {
+            return Ok(());
+        }
+        require!(pending_op.callback_applied, ErrorCode::OperationNotComputed);
+        require!(
+            pending_op.kind == OperationKind::Deposit as u8,
+            ErrorCode::InvalidOperationKind
+        );
+        require!(
+            pending_op.status == STATUS_COMPUTED_SUCCESS
+                || pending_op.status == STATUS_COMPUTED_FAILURE,
+            ErrorCode::InvalidOperationPhase
+        );
+
+        if pending_op.ok {
+            pending_op.status = OperationStatus::Settled as u8;
+            emit!(OperationSettledEvent {
+                operation_id: pending_op.operation_id,
+                kind: pending_op.kind,
+                final_status: pending_op.status,
+                amount_out: pending_op.amount_out,
+            });
+            return Ok(());
+        }
+
+        let cvct_mint_key = ctx.accounts.cvct_mint.key();
+        let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
+        let signer_seeds = &[&vault_seeds[..]];
+
+        transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.vault_token_account.to_account_info(),
+                    to: ctx.accounts.user_token_account.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            pending_op.amount_in,
+        )?;
+
+        pending_op.status = OperationStatus::Refunded as u8;
+        emit!(OperationSettledEvent {
+            operation_id: pending_op.operation_id,
+            kind: pending_op.kind,
+            final_status: pending_op.status,
+            amount_out: pending_op.amount_in,
+        });
+        Ok(())
+    }
+
+    pub fn request_redeem(
+        ctx: Context<RequestRedeem>,
         computation_offset: u64,
-        amount: u64,
+        operation_id: u64,
+        shares_in: u64,
+        quoted_assets_out: u64,
         owner_enc_pubkey: [u8; 32],
         owner_balance_nonce: u128,
         owner_new_balance_nonce: u128,
@@ -377,7 +503,35 @@ pub mod cvct {
         vault_total_locked_nonce: u128,
         vault_new_total_locked_nonce: u128,
     ) -> Result<()> {
-        require!(amount > 0, ErrorCode::ZeroAmount);
+        require!(shares_in > 0, ErrorCode::ZeroAmount);
+        require!(quoted_assets_out > 0, ErrorCode::ZeroAmount);
+        require!(
+            shares_in <= MAX_SAFE_OPERAND_U64 && quoted_assets_out <= MAX_SAFE_OPERAND_U64,
+            ErrorCode::MathOperandOutOfRange
+        );
+
+        let pending_op = &mut ctx.accounts.pending_operation;
+        pending_op.set_inner(PendingOperation {
+            operation_id,
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            user: ctx.accounts.user.key(),
+            user_token_account: ctx.accounts.user_token_account.key(),
+            vault_token_account: ctx.accounts.vault_token_account.key(),
+            kind: OperationKind::Redeem as u8,
+            status: STATUS_REQUESTED,
+            callback_applied: false,
+            computed_at_slot: 0,
+            ok: false,
+            amount_in: shares_in,
+            amount_out: 0,
+        });
+        emit!(OperationRequestedEvent {
+            operation_id,
+            kind: OperationKind::Redeem as u8,
+            user: ctx.accounts.user.key(),
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            amount_in: shares_in,
+        });
 
         let args = ArgBuilder::new()
             // Balance input from account data.
@@ -389,7 +543,9 @@ pub mod cvct {
                 (32 * ENCRYPTED_U128_CIPHERTEXTS) as u32,
             )
             // Plaintext burn amount.
-            .plaintext_u128(amount as u128)
+            .plaintext_u128(shares_in as u128)
+            // Caller-provided quote to verify in MPC.
+            .plaintext_u128(quoted_assets_out as u128)
             // Output encryption context for balance.
             .x25519_pubkey(owner_enc_pubkey)
             .plaintext_u128(owner_new_balance_nonce)
@@ -441,16 +597,8 @@ pub mod cvct {
                         is_writable: true,
                     },
                     CallbackAccount {
-                        pubkey: ctx.accounts.vault_token_account.key(),
+                        pubkey: ctx.accounts.pending_operation.key(),
                         is_writable: true,
-                    },
-                    CallbackAccount {
-                        pubkey: ctx.accounts.user_token_account.key(),
-                        is_writable: true,
-                    },
-                    CallbackAccount {
-                        pubkey: ctx.accounts.token_program.key(),
-                        is_writable: false,
                     },
                 ],
             )?],
@@ -466,7 +614,7 @@ pub mod cvct {
         ctx: Context<BurnAndWithdrawCallback>,
         output: SignedComputationOutputs<BurnAndWithdrawOutput>,
     ) -> Result<()> {
-        let (balance, total_supply, total_locked, ok, amount) = match output.verify_output(
+        let (balance, total_supply, total_locked, ok, assets_out) = match output.verify_output(
             &ctx.accounts.cluster_account,
             &ctx.accounts.computation_account,
         ) {
@@ -477,9 +625,9 @@ pub mod cvct {
                         field_1: total_supply,
                         field_2: total_locked,
                         field_3: ok,
-                        field_4: amount,
+                        field_4: assets_out,
                     },
-            }) => (balance, total_supply, total_locked, ok, amount),
+            }) => (balance, total_supply, total_locked, ok, assets_out),
             Err(_) => return Err(ErrorCode::AbortedComputation.into()),
         };
 
@@ -496,29 +644,94 @@ pub mod cvct {
         vault.total_locked = total_locked.ciphertexts;
         vault.total_locked_nonce = total_locked.nonce;
 
-        if ok {
-            let amount_u64: u64 = amount.try_into().map_err(|_| ErrorCode::InvalidAmount)?;
-            let cvct_mint_key = cvct_mint.key();
-            let vault_seeds = &[
-                b"vault".as_ref(),
-                cvct_mint_key.as_ref(),
-                &[ctx.bumps.vault],
-            ];
-            let signer_seeds = &[&vault_seeds[..]];
+        let pending_op = &mut ctx.accounts.pending_operation;
+        require!(
+            pending_op.status == STATUS_REQUESTED,
+            ErrorCode::InvalidOperationPhase
+        );
+        require!(!pending_op.callback_applied, ErrorCode::CallbackAlreadyApplied);
+        pending_op.ok = ok;
+        pending_op.amount_out = assets_out
+            .try_into()
+            .map_err(|_| ErrorCode::InvalidAmount)?;
+        pending_op.callback_applied = true;
+        pending_op.computed_at_slot = Clock::get()?.slot;
+        pending_op.status = if ok {
+            STATUS_COMPUTED_SUCCESS
+        } else {
+            STATUS_COMPUTED_FAILURE
+        };
+        emit!(OperationComputedEvent {
+            operation_id: pending_op.operation_id,
+            kind: pending_op.kind,
+            ok: pending_op.ok,
+            amount_out: pending_op.amount_out,
+        });
 
-            transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from: ctx.accounts.vault_token_account.to_account_info(),
-                        to: ctx.accounts.user_token_account.to_account_info(),
-                        authority: vault.to_account_info(),
-                    },
-                    signer_seeds,
-                ),
-                amount_u64,
-            )?;
+        Ok(())
+    }
+
+    pub fn settle_redeem(ctx: Context<SettleRedeem>) -> Result<()> {
+        let pending_op = &mut ctx.accounts.pending_operation;
+        if is_terminal_status(pending_op.status) {
+            return Ok(());
         }
+        require!(pending_op.callback_applied, ErrorCode::OperationNotComputed);
+        require!(
+            pending_op.kind == OperationKind::Redeem as u8,
+            ErrorCode::InvalidOperationKind
+        );
+        require!(
+            pending_op.status == STATUS_COMPUTED_SUCCESS
+                || pending_op.status == STATUS_COMPUTED_FAILURE,
+            ErrorCode::InvalidOperationPhase
+        );
+        if !pending_op.ok {
+            pending_op.status = OperationStatus::Failed as u8;
+            emit!(OperationSettledEvent {
+                operation_id: pending_op.operation_id,
+                kind: pending_op.kind,
+                final_status: pending_op.status,
+                amount_out: 0,
+            });
+            return Ok(());
+        }
+
+        let cvct_mint_key = ctx.accounts.cvct_mint.key();
+        let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
+        let signer_seeds = &[&vault_seeds[..]];
+
+        transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.vault_token_account.to_account_info(),
+                    to: ctx.accounts.user_token_account.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            pending_op.amount_out,
+        )?;
+
+        pending_op.status = OperationStatus::Settled as u8;
+        emit!(OperationSettledEvent {
+            operation_id: pending_op.operation_id,
+            kind: pending_op.kind,
+            final_status: pending_op.status,
+            amount_out: pending_op.amount_out,
+        });
+        Ok(())
+    }
+
+    pub fn sync_total_assets(
+        ctx: Context<SyncTotalAssets>,
+        total_locked_ciphertext: [u8; 32],
+        total_locked_nonce: u128,
+    ) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.total_locked = [total_locked_ciphertext];
+        vault.total_locked_nonce = total_locked_nonce;
 
         Ok(())
     }
@@ -671,6 +884,75 @@ pub struct CvctAccount {
 
 impl CvctAccount {
     pub const LEN: usize = 32 + 32 + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS) + 16;
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Eq, PartialEq)]
+pub enum OperationKind {
+    Deposit = 1,
+    Redeem = 2,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Eq, PartialEq)]
+pub enum OperationStatus {
+    Requested = 0,
+    ComputedSuccess = 1,
+    ComputedFailure = 2,
+    Settled = 3,
+    Refunded = 4,
+    Failed = 5,
+}
+
+#[account]
+pub struct PendingOperation {
+    pub operation_id: u64,
+    pub cvct_mint: Pubkey,
+    pub user: Pubkey,
+    pub user_token_account: Pubkey,
+    pub vault_token_account: Pubkey,
+    pub kind: u8,
+    pub status: u8,
+    pub callback_applied: bool,
+    pub computed_at_slot: u64,
+    pub ok: bool,
+    /// Assets in for deposits, shares in for redeems.
+    pub amount_in: u64,
+    /// Shares out for deposits, assets out for redeems.
+    pub amount_out: u64,
+}
+
+impl PendingOperation {
+    pub const LEN: usize = 8 + (32 * 4) + 1 + 1 + 1 + 8 + 1 + 8 + 8;
+}
+
+fn is_terminal_status(status: u8) -> bool {
+    status == OperationStatus::Settled as u8
+        || status == OperationStatus::Refunded as u8
+        || status == OperationStatus::Failed as u8
+}
+
+#[event]
+pub struct OperationRequestedEvent {
+    pub operation_id: u64,
+    pub kind: u8,
+    pub user: Pubkey,
+    pub cvct_mint: Pubkey,
+    pub amount_in: u64,
+}
+
+#[event]
+pub struct OperationComputedEvent {
+    pub operation_id: u64,
+    pub kind: u8,
+    pub ok: bool,
+    pub amount_out: u64,
+}
+
+#[event]
+pub struct OperationSettledEvent {
+    pub operation_id: u64,
+    pub kind: u8,
+    pub final_status: u8,
+    pub amount_out: u64,
 }
 
 #[queue_computation_accounts("init_mint_state", authority)]
@@ -880,8 +1162,8 @@ pub struct InitAccountStateCallback<'info> {
 
 #[queue_computation_accounts("deposit_and_mint", user)]
 #[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct DepositAndMint<'info> {
+#[instruction(computation_offset: u64, operation_id: u64)]
+pub struct RequestDeposit<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(
@@ -932,10 +1214,7 @@ pub struct DepositAndMint<'info> {
     pub clock_account: Box<Account<'info, ClockAccount>>,
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
-    #[account(
-        mut,
-        constraint = cvct_mint.authority == user.key() @ ErrorCode::Unauthorized,
-    )]
+    #[account(mut)]
     pub cvct_mint: Box<Account<'info, CvctMint>>,
     #[account(
         mut,
@@ -963,6 +1242,19 @@ pub struct DepositAndMint<'info> {
         constraint = vault_token_account.key() == vault.backing_token_account,
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
+    #[account(
+        init,
+        payer = user,
+        space = 8 + PendingOperation::LEN,
+        seeds = [
+            b"pending_op",
+            cvct_mint.key().as_ref(),
+            user.key().as_ref(),
+            operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -992,15 +1284,25 @@ pub struct DepositAndMintCallback<'info> {
     #[account(mut)]
     /// CVCT mint to update encrypted total supply.
     pub cvct_mint: Box<Account<'info, CvctMint>>,
-    #[account(mut)]
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
+    )]
     /// Vault to update encrypted total locked.
     pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        mut,
+        constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.kind == OperationKind::Deposit as u8 @ ErrorCode::InvalidOperationKind,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
 }
 
 #[queue_computation_accounts("burn_and_withdraw", user)]
 #[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct BurnAndWithdraw<'info> {
+#[instruction(computation_offset: u64, operation_id: u64)]
+pub struct RequestRedeem<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(
@@ -1079,6 +1381,19 @@ pub struct BurnAndWithdraw<'info> {
         constraint = vault_token_account.key() == vault.backing_token_account,
     )]
     pub vault_token_account: Account<'info, TokenAccount>,
+    #[account(
+        init,
+        payer = user,
+        space = 8 + PendingOperation::LEN,
+        seeds = [
+            b"pending_op",
+            cvct_mint.key().as_ref(),
+            user.key().as_ref(),
+            operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -1113,13 +1428,88 @@ pub struct BurnAndWithdrawCallback<'info> {
         seeds = [b"vault", cvct_mint.key().as_ref()],
         bump,
     )]
-    /// Vault to update encrypted total locked and sign SPL transfer.
+    /// Vault to update encrypted total locked.
     pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        mut,
+        constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.kind == OperationKind::Redeem as u8 @ ErrorCode::InvalidOperationKind,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
+}
+
+#[derive(Accounts)]
+pub struct SettleDeposit<'info> {
     #[account(mut)]
+    pub executor: Signer<'info>,
+    #[account(mut)]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
+        constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        mut,
+        constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.kind == OperationKind::Deposit as u8 @ ErrorCode::InvalidOperationKind,
+        constraint = pending_operation.user_token_account == user_token_account.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.vault_token_account == vault_token_account.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(mut, constraint = vault_token_account.key() == vault.backing_token_account)]
     pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
+    #[account(mut, constraint = user_token_account.mint == cvct_mint.backing_mint)]
     pub user_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SettleRedeem<'info> {
+    #[account(mut)]
+    pub executor: Signer<'info>,
+    #[account(mut)]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
+        constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        mut,
+        constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.kind == OperationKind::Redeem as u8 @ ErrorCode::InvalidOperationKind,
+        constraint = pending_operation.user_token_account == user_token_account.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.vault_token_account == vault_token_account.key() @ ErrorCode::InvalidPendingOperation,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(mut, constraint = vault_token_account.key() == vault.backing_token_account)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+    #[account(mut, constraint = user_token_account.mint == cvct_mint.backing_mint)]
+    pub user_token_account: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct SyncTotalAssets<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
+    )]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
+        constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
 }
 
 #[queue_computation_accounts("transfer_cvct", user)]
@@ -1310,4 +1700,16 @@ pub enum ErrorCode {
     ZeroAmount,
     #[msg("Invalid amount")]
     InvalidAmount,
+    #[msg("Invalid operation kind")]
+    InvalidOperationKind,
+    #[msg("Invalid pending operation")]
+    InvalidPendingOperation,
+    #[msg("Operation has not been computed yet")]
+    OperationNotComputed,
+    #[msg("Invalid operation phase for this instruction")]
+    InvalidOperationPhase,
+    #[msg("Callback already applied for this operation")]
+    CallbackAlreadyApplied,
+    #[msg("Math operand out of safe range")]
+    MathOperandOutOfRange,
 }
