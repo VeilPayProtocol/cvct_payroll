@@ -96,6 +96,7 @@ export type Fixture = {
 export type RequestResult = {
   operationPda: PublicKey;
   depositResultPda?: PublicKey;
+  redeemResultPda?: PublicKey;
   computationOffset: anchor.BN;
   deadlineSlot?: anchor.BN;
 };
@@ -603,6 +604,15 @@ export async function requestRedeem(
     ],
     harness.program.programId,
   );
+  const [redeemResultPda] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pending_redeem_result"),
+      fixture.cvctMintPda.toBuffer(),
+      harness.payer.publicKey.toBuffer(),
+      Buffer.from(operationId.toArray("le", 8)),
+    ],
+    harness.program.programId,
+  );
 
   const newBalanceNonce = randomNonce();
   const newSupplyNonce = randomNonce();
@@ -611,7 +621,7 @@ export async function requestRedeem(
 
   await rpcWithLogs(
     (harness.program.methods as any)
-      .requestRedeem(
+      .requestRedeemIntent(
         computationOffset,
         operationId,
         new anchor.BN(sharesIn),
@@ -634,6 +644,7 @@ export async function requestRedeem(
         userTokenAccount: fixture.userTokenAccount,
         vaultTokenAccount: fixture.vaultTokenAccount,
         pendingOperation: operationPda,
+        pendingRedeemResult: redeemResultPda,
         tokenProgram: TOKEN_PROGRAM_ID,
         mxeAccount: getMXEAccAddress(harness.program.programId),
         mempoolAccount: getMempoolAccAddress(harness.arciumEnv.arciumClusterOffset),
@@ -653,11 +664,11 @@ export async function requestRedeem(
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "requestRedeem",
+    "requestRedeemIntent",
     harness.provider.connection,
   );
 
-  return { operationPda, computationOffset };
+  return { operationPda, redeemResultPda, computationOffset };
 }
 
 export async function finalizeAndSettleDeposit(
@@ -696,18 +707,20 @@ export async function finalizeAndSettleRedeem(
 
   await rpcWithLogs(
     (harness.program.methods as any)
-      .settleRedeem()
+      .settleRedeemCommit()
       .accountsPartial({
         executor: harness.payer.publicKey,
         cvctMint: fixture.cvctMintPda,
         vault: fixture.vaultPda,
         pendingOperation: req.operationPda,
+        pendingRedeemResult: req.redeemResultPda,
+        cvctAccount: fixture.cvctAccountPda,
         vaultTokenAccount: fixture.vaultTokenAccount,
         userTokenAccount: fixture.userTokenAccount,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "settleRedeem",
+    "settleRedeemCommit",
     harness.provider.connection,
   );
 }
@@ -874,6 +887,13 @@ export async function fetchPendingDepositResult(
   return (fixture.harness.program.account as any).pendingDepositResult.fetch(resultPda);
 }
 
+export async function fetchPendingRedeemResult(
+  fixture: Fixture,
+  resultPda: PublicKey,
+): Promise<any> {
+  return (fixture.harness.program.account as any).pendingRedeemResult.fetch(resultPda);
+}
+
 export async function fetchUserBackingBalance(fixture: Fixture): Promise<number> {
   const user = await getAccount(
     fixture.harness.provider.connection,
@@ -1001,14 +1021,17 @@ export async function expireDepositIntentCall(
 export async function settleRedeemCall(
   fixture: Fixture,
   operationPda: PublicKey,
+  redeemResultPda?: PublicKey,
 ): Promise<unknown> {
   return (fixture.harness.program.methods as any)
-    .settleRedeem()
+    .settleRedeemCommit()
     .accountsPartial({
       executor: fixture.harness.payer.publicKey,
       cvctMint: fixture.cvctMintPda,
       vault: fixture.vaultPda,
       pendingOperation: operationPda,
+      pendingRedeemResult: redeemResultPda,
+      cvctAccount: fixture.cvctAccountPda,
       vaultTokenAccount: fixture.vaultTokenAccount,
       userTokenAccount: fixture.userTokenAccount,
       tokenProgram: TOKEN_PROGRAM_ID,

@@ -15,6 +15,7 @@ import {
   expireDepositIntentCall,
   fetchUserBackingBalance,
   fetchPendingDepositResult,
+  fetchPendingRedeemResult,
   fetchPendingStatus,
   finalizeAndSettleDeposit,
   finalizeAndSettleRedeem,
@@ -29,7 +30,6 @@ import {
 } from "./helpers/cvctHarness";
 
 const STATUS_SETTLED = 3;
-const STATUS_REFUNDED = 4;
 const STATUS_FAILED = 5;
 const STATUS_CANCELLED = 6;
 const STATUS_EXPIRED = 7;
@@ -253,7 +253,40 @@ describe("Cvct", () => {
     );
     const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
 
-    await assertEarlySettleRejected(settleRedeemCall(fixture, redeemReq.operationPda));
+    await assertEarlySettleRejected(
+      settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda),
+    );
+  });
+
+  it("[redeem] callback stages result without mutating canonical state", async () => {
+    const fixture = await createFixture(harness);
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    const beforeState = await getDecryptedState(fixture);
+    await awaitOperationComputation(fixture, redeemReq);
+
+    const afterState = await getDecryptedState(fixture);
+    expect(afterState.decryptedBalance).to.equal(beforeState.decryptedBalance);
+    expect(afterState.decryptedSupply).to.equal(beforeState.decryptedSupply);
+    expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
+
+    const staged = await fetchPendingRedeemResult(fixture, redeemReq.redeemResultPda!);
+    const op = await (fixture.harness.program.account as any).pendingOperation.fetch(
+      redeemReq.operationPda,
+    );
+    expect(staged.ok).to.equal(true);
+    expect(Number(staged.assetsOut)).to.equal(redeemQuote);
+    expect(staged.operationId.toString()).to.equal(op.operationId.toString());
+    expect(staged.cvctMint.toBase58()).to.equal(fixture.cvctMintPda.toBase58());
+    expect(staged.user.toBase58()).to.equal(harness.payer.publicKey.toBase58());
   });
 
   it("[redeem] settles success/failure path and is idempotent", async () => {
@@ -273,7 +306,9 @@ describe("Cvct", () => {
       STATUS_SETTLED,
     );
 
-    await assertTerminalNoopOnResettle(() => settleRedeemCall(fixture, successReq.operationPda));
+    await assertTerminalNoopOnResettle(() =>
+      settleRedeemCall(fixture, successReq.operationPda, successReq.redeemResultPda),
+    );
     expect(await fetchPendingStatus(fixture, successReq.operationPda)).to.equal(
       STATUS_SETTLED,
     );
@@ -284,10 +319,45 @@ describe("Cvct", () => {
       STATUS_FAILED,
     );
 
-    await assertTerminalNoopOnResettle(() => settleRedeemCall(fixture, failureReq.operationPda));
+    await assertTerminalNoopOnResettle(() =>
+      settleRedeemCall(fixture, failureReq.operationPda, failureReq.redeemResultPda),
+    );
     expect(await fetchPendingStatus(fixture, failureReq.operationPda)).to.equal(
       STATUS_FAILED,
     );
+  });
+
+  it("[redeem] rejects mismatched staged result wiring before custody movement", async () => {
+    const fixture = await createFixture(harness);
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const reqA = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    const reqB = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    await awaitOperationComputation(fixture, reqA);
+    await awaitOperationComputation(fixture, reqB);
+
+    const beforeState = await getDecryptedState(fixture);
+    await expectRpcFailure(
+      settleRedeemCall(fixture, reqA.operationPda, reqB.redeemResultPda),
+      "A seeds constraint was violated",
+    );
+
+    await assertTokenBalances(
+      fixture,
+      1_000_000 - fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const afterState = await getDecryptedState(fixture);
+    expect(afterState.decryptedBalance).to.equal(beforeState.decryptedBalance);
+    expect(afterState.decryptedSupply).to.equal(beforeState.decryptedSupply);
+    expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
   });
 
   it("[redeem] rejects zero share requests", async () => {

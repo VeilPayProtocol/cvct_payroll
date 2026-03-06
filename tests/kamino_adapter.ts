@@ -206,15 +206,20 @@ describe("Cvct Kamino Adapter", () => {
     );
     const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
     await awaitOperationComputation(fixture, redeemReq);
+    const beforeState = await getDecryptedState(fixture);
 
     await expectRpcFailure(
-      settleRedeemCall(fixture, redeemReq.operationPda),
+      settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda),
       "Insufficient idle vault liquidity for redeem settlement",
     );
+    const afterFailedSettle = await getDecryptedState(fixture);
+    expect(afterFailedSettle.decryptedBalance).to.equal(beforeState.decryptedBalance);
+    expect(afterFailedSettle.decryptedSupply).to.equal(beforeState.decryptedSupply);
+    expect(afterFailedSettle.decryptedLocked).to.equal(beforeState.decryptedLocked);
 
     const sharesBalance = await vaultSharesTokenAmount(kamino, harness.connection);
     await kaminoWithdrawToVault(fixture, kaminoAdapterPda, kamino, sharesBalance);
-    await settleRedeemCall(fixture, redeemReq.operationPda);
+    await settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda);
 
     const state = await getDecryptedState(fixture);
     expect(state.decryptedSupply).to.equal(BigInt(fixture.depositAmount - fixture.burnAmount));
