@@ -1,0 +1,180 @@
+import * as anchor from "@coral-xyz/anchor";
+import { expect } from "chai";
+import {
+  awaitOperationComputation,
+  createFixture,
+  createHarness,
+  expectRpcFailure,
+  finalizeAndSettleDeposit,
+  getDecryptedState,
+  previewDepositShares,
+  previewRedeemAssets,
+  requestDeposit,
+  requestRedeem,
+  settleRedeemCall,
+} from "./helpers/cvctHarness";
+import {
+  assertKaminoArtifactsPresent,
+  assertKaminoProgramsLoaded,
+  bootstrapKaminoVault,
+  configureCvctKaminoAdapter,
+  deriveKaminoPdas,
+  KAMINO_KLEND_PROGRAM_ID,
+  KAMINO_VAULT_PROGRAM_ID,
+  kaminoDepositIdle,
+  kaminoWithdrawToVault,
+  shouldRunKaminoLocalTests,
+  vaultBackedTokenAmount,
+  vaultSharesTokenAmount,
+} from "./helpers/kaminoLocal";
+
+describe("Cvct Kamino Adapter", () => {
+  const itLocalOnly = shouldRunKaminoLocalTests() ? it : it.skip;
+
+  before(async () => {
+    if (!shouldRunKaminoLocalTests()) {
+      return;
+    }
+
+    assertKaminoArtifactsPresent();
+    const harness = await createHarness(false);
+    await assertKaminoProgramsLoaded(harness.connection);
+  });
+
+  it("configures kamino adapter state for a cvct mint", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+
+    const vaultState = anchor.web3.Keypair.generate().publicKey;
+    const pdas = deriveKaminoPdas(vaultState);
+    const [kaminoAdapterPda] = anchor.web3.PublicKey.findProgramAddressSync(
+      [Buffer.from("kamino_adapter"), fixture.cvctMintPda.toBuffer()],
+      harness.program.programId,
+    );
+
+    await (harness.program.methods as any)
+      .configureKaminoAdapter({
+        kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
+        klendProgram: KAMINO_KLEND_PROGRAM_ID,
+        vaultState,
+        globalConfig: pdas.globalConfig,
+        baseVaultAuthority: pdas.baseVaultAuthority,
+        tokenVault: pdas.tokenVault,
+        sharesMint: pdas.sharesMint,
+        eventAuthority: pdas.eventAuthority,
+        enabled: true,
+      })
+      .accountsPartial({
+        authority: fixture.authoritySigner.publicKey,
+        cvctMint: fixture.cvctMintPda,
+        kaminoAdapter: kaminoAdapterPda,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([fixture.authoritySigner])
+      .rpc({ skipPreflight: true, commitment: "confirmed" });
+
+    const adapter = await (harness.program.account as any).kaminoAdapterState.fetch(
+      kaminoAdapterPda,
+    );
+
+    expect(adapter.enabled).to.eq(true);
+    expect(adapter.cvctMint.toBase58()).to.eq(fixture.cvctMintPda.toBase58());
+    expect(adapter.vaultState.toBase58()).to.eq(vaultState.toBase58());
+  });
+
+  itLocalOnly("manually deposits idle vault assets into kamino and withdraws them back", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+    const kamino = await bootstrapKaminoVault(fixture);
+    const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const beforeKaminoDeposit = await vaultBackedTokenAmount(fixture);
+    await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 300_000);
+    const afterKaminoDeposit = await vaultBackedTokenAmount(fixture);
+    const sharesAfterDeposit = await vaultSharesTokenAmount(
+      kamino,
+      harness.connection,
+    );
+
+    expect(afterKaminoDeposit).to.be.lessThan(beforeKaminoDeposit);
+    expect(sharesAfterDeposit).to.be.greaterThan(0);
+
+    await kaminoWithdrawToVault(
+      fixture,
+      kaminoAdapterPda,
+      kamino,
+      sharesAfterDeposit,
+    );
+    const afterKaminoWithdraw = await vaultBackedTokenAmount(fixture);
+
+    expect(afterKaminoWithdraw).to.be.greaterThan(afterKaminoDeposit);
+  });
+
+  itLocalOnly("requires manual kamino withdraw before redeem settle when idle liquidity is low", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+    const kamino = await bootstrapKaminoVault(fixture);
+    const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 400_000);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    await awaitOperationComputation(fixture, redeemReq);
+
+    await expectRpcFailure(
+      settleRedeemCall(fixture, redeemReq.operationPda),
+      "Insufficient idle vault liquidity for redeem settlement",
+    );
+
+    const sharesBalance = await vaultSharesTokenAmount(kamino, harness.connection);
+    await kaminoWithdrawToVault(fixture, kaminoAdapterPda, kamino, sharesBalance);
+    await settleRedeemCall(fixture, redeemReq.operationPda);
+
+    const state = await getDecryptedState(fixture);
+    expect(state.decryptedSupply).to.equal(BigInt(fixture.depositAmount - fixture.burnAmount));
+    expect(state.decryptedLocked).to.equal(BigInt(fixture.depositAmount - fixture.burnAmount));
+  });
+
+  itLocalOnly("allows adapter-aware asset sync after manual treasury movement", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+    const kamino = await bootstrapKaminoVault(fixture);
+    const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 250_000);
+    const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
+    await (harness.program.methods as any)
+      .syncTotalAssetsFromAdapter(
+        Array.from(vaultBefore.totalLocked[0]),
+        vaultBefore.totalLockedNonce,
+      )
+      .accountsPartial({
+        authority: fixture.authoritySigner.publicKey,
+        cvctMint: fixture.cvctMintPda,
+        vault: fixture.vaultPda,
+        kaminoAdapter: kaminoAdapterPda,
+      })
+      .signers([fixture.authoritySigner])
+      .rpc({ skipPreflight: true, commitment: "confirmed" });
+
+    const state = await getDecryptedState(fixture);
+    expect(state.decryptedLocked).to.equal(BigInt(fixture.depositAmount));
+  });
+});

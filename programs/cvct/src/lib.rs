@@ -1,4 +1,8 @@
-use anchor_lang::prelude::*;
+use anchor_lang::{prelude::*, InstructionData};
+use anchor_lang::solana_program::{
+    instruction::{AccountMeta, Instruction},
+    program::invoke_signed,
+};
 use anchor_spl::{
     associated_token::AssociatedToken,
     token::{transfer, Mint, Token, TokenAccount, Transfer},
@@ -13,6 +17,12 @@ const COMP_DEF_OFFSET_BURN_AND_WITHDRAW: u32 = comp_def_offset("burn_and_withdra
 const COMP_DEF_OFFSET_TRANSFER_CVCT: u32 = comp_def_offset("transfer_cvct");
 const ENCRYPTED_U128_CIPHERTEXTS: usize = 1;
 const MAX_SAFE_OPERAND_U64: u64 = u64::MAX - 1;
+const KAMINO_VAULT_ID: Pubkey = pubkey!("KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd");
+const KAMINO_BASE_VAULT_AUTHORITY_SEED: &[u8] = b"authority";
+const KAMINO_TOKEN_VAULT_SEED: &[u8] = b"token_vault";
+const KAMINO_SHARES_SEED: &[u8] = b"shares";
+const KAMINO_EVENT_AUTHORITY_SEED: &[u8] = b"__event_authority";
+const KAMINO_GLOBAL_CONFIG_STATE_SEED: &[u8] = b"global_config";
 
 declare_id!("B4rLKdnQsFH2e4CBefgWsBXZ7xsX4ewb7QUiMim4Nbvj");
 
@@ -697,6 +707,11 @@ pub mod cvct {
             return Ok(());
         }
 
+        require!(
+            ctx.accounts.vault_token_account.amount >= pending_op.amount_out,
+            ErrorCode::InsufficientIdleLiquidity
+        );
+
         let cvct_mint_key = ctx.accounts.cvct_mint.key();
         let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
         let signer_seeds = &[&vault_seeds[..]];
@@ -724,6 +739,183 @@ pub mod cvct {
         Ok(())
     }
 
+    pub fn configure_kamino_adapter(
+        ctx: Context<ConfigureKaminoAdapter>,
+        config: KaminoAdapterConfigArgs,
+    ) -> Result<()> {
+        require!(
+            config.kamino_program == KAMINO_VAULT_ID,
+            ErrorCode::InvalidKaminoAdapterConfig
+        );
+        let (expected_base_vault_authority, _) = Pubkey::find_program_address(
+            &[KAMINO_BASE_VAULT_AUTHORITY_SEED, config.vault_state.as_ref()],
+            &config.kamino_program,
+        );
+        let (expected_token_vault, _) = Pubkey::find_program_address(
+            &[KAMINO_TOKEN_VAULT_SEED, config.vault_state.as_ref()],
+            &config.kamino_program,
+        );
+        let (expected_shares_mint, _) = Pubkey::find_program_address(
+            &[KAMINO_SHARES_SEED, config.vault_state.as_ref()],
+            &config.kamino_program,
+        );
+        let (expected_event_authority, _) = Pubkey::find_program_address(
+            &[KAMINO_EVENT_AUTHORITY_SEED],
+            &config.kamino_program,
+        );
+        let (expected_global_config, _) = Pubkey::find_program_address(
+            &[KAMINO_GLOBAL_CONFIG_STATE_SEED],
+            &config.kamino_program,
+        );
+
+        require!(
+            config.base_vault_authority == expected_base_vault_authority,
+            ErrorCode::InvalidKaminoAdapterConfig
+        );
+        require!(
+            config.token_vault == expected_token_vault,
+            ErrorCode::InvalidKaminoAdapterConfig
+        );
+        require!(
+            config.shares_mint == expected_shares_mint,
+            ErrorCode::InvalidKaminoAdapterConfig
+        );
+        require!(
+            config.event_authority == expected_event_authority,
+            ErrorCode::InvalidKaminoAdapterConfig
+        );
+        require!(
+            config.global_config == expected_global_config,
+            ErrorCode::InvalidKaminoAdapterConfig
+        );
+
+        let adapter = &mut ctx.accounts.kamino_adapter;
+        adapter.cvct_mint = ctx.accounts.cvct_mint.key();
+        adapter.kamino_program = config.kamino_program;
+        adapter.klend_program = config.klend_program;
+        adapter.vault_state = config.vault_state;
+        adapter.global_config = config.global_config;
+        adapter.base_vault_authority = config.base_vault_authority;
+        adapter.token_vault = config.token_vault;
+        adapter.shares_mint = config.shares_mint;
+        adapter.event_authority = config.event_authority;
+        adapter.enabled = config.enabled;
+        Ok(())
+    }
+
+    pub fn kamino_deposit_idle(ctx: Context<KaminoDepositIdle>, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::ZeroAmount);
+
+        let cvct_mint_key = ctx.accounts.cvct_mint.key();
+        let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
+        let signer_seeds = &[&vault_seeds[..]];
+
+        let ix_data = kamino_vault::instruction::Deposit {
+            _max_amount: amount,
+        }
+        .data();
+        let ix = Instruction {
+            program_id: ctx.accounts.kamino_program.key(),
+            accounts: vec![
+                AccountMeta::new(ctx.accounts.vault.key(), true),
+                AccountMeta::new(ctx.accounts.kamino_vault_state.key(), false),
+                AccountMeta::new(ctx.accounts.kamino_token_vault.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.kamino_token_mint.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.kamino_base_vault_authority.key(), false),
+                AccountMeta::new(ctx.accounts.kamino_shares_mint.key(), false),
+                AccountMeta::new(ctx.accounts.vault_backing_token_account.key(), false),
+                AccountMeta::new(ctx.accounts.vault_shares_token_account.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.klend_program.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.shares_token_program.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.kamino_event_authority.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.kamino_program.key(), false),
+            ],
+            data: ix_data,
+        };
+
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.kamino_vault_state.to_account_info(),
+                ctx.accounts.kamino_token_vault.to_account_info(),
+                ctx.accounts.kamino_token_mint.to_account_info(),
+                ctx.accounts.kamino_base_vault_authority.to_account_info(),
+                ctx.accounts.kamino_shares_mint.to_account_info(),
+                ctx.accounts.vault_backing_token_account.to_account_info(),
+                ctx.accounts.vault_shares_token_account.to_account_info(),
+                ctx.accounts.klend_program.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.shares_token_program.to_account_info(),
+                ctx.accounts.kamino_event_authority.to_account_info(),
+                ctx.accounts.kamino_program.to_account_info(),
+            ],
+            signer_seeds,
+        )?;
+
+        Ok(())
+    }
+
+    pub fn kamino_withdraw_to_vault(
+        ctx: Context<KaminoWithdrawToVault>,
+        shares_amount: u64,
+    ) -> Result<()> {
+        require!(shares_amount > 0, ErrorCode::ZeroAmount);
+
+        let cvct_mint_key = ctx.accounts.cvct_mint.key();
+        let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
+        let signer_seeds = &[&vault_seeds[..]];
+
+        let ix_data = kamino_vault::instruction::WithdrawFromAvailable {
+            _shares_amount: shares_amount,
+        }
+        .data();
+        let ix = Instruction {
+            program_id: ctx.accounts.kamino_program.key(),
+            accounts: vec![
+                AccountMeta::new(ctx.accounts.vault.key(), true),
+                AccountMeta::new(ctx.accounts.kamino_vault_state.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.kamino_global_config.key(), false),
+                AccountMeta::new(ctx.accounts.kamino_token_vault.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.kamino_base_vault_authority.key(), false),
+                AccountMeta::new(ctx.accounts.vault_backing_token_account.key(), false),
+                AccountMeta::new(ctx.accounts.kamino_token_mint.key(), false),
+                AccountMeta::new(ctx.accounts.vault_shares_token_account.key(), false),
+                AccountMeta::new(ctx.accounts.kamino_shares_mint.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.shares_token_program.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.klend_program.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.kamino_event_authority.key(), false),
+                AccountMeta::new_readonly(ctx.accounts.kamino_program.key(), false),
+            ],
+            data: ix_data,
+        };
+
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.kamino_vault_state.to_account_info(),
+                ctx.accounts.kamino_global_config.to_account_info(),
+                ctx.accounts.kamino_token_vault.to_account_info(),
+                ctx.accounts.kamino_base_vault_authority.to_account_info(),
+                ctx.accounts.vault_backing_token_account.to_account_info(),
+                ctx.accounts.kamino_token_mint.to_account_info(),
+                ctx.accounts.vault_shares_token_account.to_account_info(),
+                ctx.accounts.kamino_shares_mint.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+                ctx.accounts.shares_token_program.to_account_info(),
+                ctx.accounts.klend_program.to_account_info(),
+                ctx.accounts.kamino_event_authority.to_account_info(),
+                ctx.accounts.kamino_program.to_account_info(),
+            ],
+            signer_seeds,
+        )?;
+
+        Ok(())
+    }
+
     pub fn sync_total_assets(
         ctx: Context<SyncTotalAssets>,
         total_locked_ciphertext: [u8; 32],
@@ -733,6 +925,17 @@ pub mod cvct {
         vault.total_locked = [total_locked_ciphertext];
         vault.total_locked_nonce = total_locked_nonce;
 
+        Ok(())
+    }
+
+    pub fn sync_total_assets_from_adapter(
+        ctx: Context<SyncTotalAssetsFromAdapter>,
+        total_locked_ciphertext: [u8; 32],
+        total_locked_nonce: u128,
+    ) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.total_locked = [total_locked_ciphertext];
+        vault.total_locked_nonce = total_locked_nonce;
         Ok(())
     }
 
@@ -922,6 +1125,37 @@ pub struct PendingOperation {
 
 impl PendingOperation {
     pub const LEN: usize = 8 + (32 * 4) + 1 + 1 + 1 + 8 + 1 + 8 + 8;
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct KaminoAdapterConfigArgs {
+    pub kamino_program: Pubkey,
+    pub klend_program: Pubkey,
+    pub vault_state: Pubkey,
+    pub global_config: Pubkey,
+    pub base_vault_authority: Pubkey,
+    pub token_vault: Pubkey,
+    pub shares_mint: Pubkey,
+    pub event_authority: Pubkey,
+    pub enabled: bool,
+}
+
+#[account]
+pub struct KaminoAdapterState {
+    pub cvct_mint: Pubkey,
+    pub kamino_program: Pubkey,
+    pub klend_program: Pubkey,
+    pub vault_state: Pubkey,
+    pub global_config: Pubkey,
+    pub base_vault_authority: Pubkey,
+    pub token_vault: Pubkey,
+    pub shares_mint: Pubkey,
+    pub event_authority: Pubkey,
+    pub enabled: bool,
+}
+
+impl KaminoAdapterState {
+    pub const LEN: usize = (32 * 9) + 1;
 }
 
 fn is_terminal_status(status: u8) -> bool {
@@ -1512,6 +1746,213 @@ pub struct SyncTotalAssets<'info> {
     pub vault: Box<Account<'info, Vault>>,
 }
 
+#[derive(Accounts)]
+pub struct ConfigureKaminoAdapter<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
+    )]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + KaminoAdapterState::LEN,
+        seeds = [b"kamino_adapter", cvct_mint.key().as_ref()],
+        bump,
+    )]
+    pub kamino_adapter: Box<Account<'info, KaminoAdapterState>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct KaminoDepositIdle<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
+    )]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
+        constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        constraint = kamino_adapter.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidKaminoAdapterConfig,
+        constraint = kamino_adapter.enabled @ ErrorCode::KaminoAdapterDisabled,
+    )]
+    pub kamino_adapter: Box<Account<'info, KaminoAdapterState>>,
+    #[account(
+        mut,
+        constraint = vault_backing_token_account.key() == vault.backing_token_account @ ErrorCode::InvalidVault
+    )]
+    pub vault_backing_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = vault_shares_token_account.owner == vault.key() @ ErrorCode::InvalidKaminoAdapterConfig,
+        constraint = vault_shares_token_account.mint == kamino_adapter.shares_mint @ ErrorCode::InvalidKaminoAdapterConfig,
+    )]
+    pub vault_shares_token_account: Account<'info, TokenAccount>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_vault_state.key() == kamino_adapter.vault_state @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_vault_state: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_token_vault.key() == kamino_adapter.token_vault @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_token_vault: UncheckedAccount<'info>,
+    /// CHECK: validated against CVCT backing mint.
+    #[account(
+        constraint = kamino_token_mint.key() == cvct_mint.backing_mint @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_token_mint: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = kamino_base_vault_authority.key() == kamino_adapter.base_vault_authority @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_base_vault_authority: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_shares_mint.key() == kamino_adapter.shares_mint @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_shares_mint: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = kamino_event_authority.key() == kamino_adapter.event_authority @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_event_authority: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        address = KAMINO_VAULT_ID,
+        constraint = kamino_program.key() == kamino_adapter.kamino_program @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_program: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = klend_program.key() == kamino_adapter.klend_program @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub klend_program: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    /// CHECK: token or token-2022 for shares mint based on Kamino setup.
+    pub shares_token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct KaminoWithdrawToVault<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
+    )]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
+        constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        constraint = kamino_adapter.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidKaminoAdapterConfig,
+        constraint = kamino_adapter.enabled @ ErrorCode::KaminoAdapterDisabled,
+    )]
+    pub kamino_adapter: Box<Account<'info, KaminoAdapterState>>,
+    #[account(
+        mut,
+        constraint = vault_backing_token_account.key() == vault.backing_token_account @ ErrorCode::InvalidVault
+    )]
+    pub vault_backing_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = vault_shares_token_account.owner == vault.key() @ ErrorCode::InvalidKaminoAdapterConfig,
+        constraint = vault_shares_token_account.mint == kamino_adapter.shares_mint @ ErrorCode::InvalidKaminoAdapterConfig,
+    )]
+    pub vault_shares_token_account: Account<'info, TokenAccount>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_vault_state.key() == kamino_adapter.vault_state @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_vault_state: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = kamino_global_config.key() == kamino_adapter.global_config @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_global_config: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_token_vault.key() == kamino_adapter.token_vault @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_token_vault: UncheckedAccount<'info>,
+    /// CHECK: validated against CVCT backing mint.
+    #[account(
+        mut,
+        constraint = kamino_token_mint.key() == cvct_mint.backing_mint @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_token_mint: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = kamino_base_vault_authority.key() == kamino_adapter.base_vault_authority @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_base_vault_authority: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_shares_mint.key() == kamino_adapter.shares_mint @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_shares_mint: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = kamino_event_authority.key() == kamino_adapter.event_authority @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_event_authority: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        address = KAMINO_VAULT_ID,
+        constraint = kamino_program.key() == kamino_adapter.kamino_program @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_program: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = klend_program.key() == kamino_adapter.klend_program @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub klend_program: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
+    /// CHECK: token or token-2022 for shares mint based on Kamino setup.
+    pub shares_token_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SyncTotalAssetsFromAdapter<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
+    )]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
+        constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        constraint = kamino_adapter.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidKaminoAdapterConfig,
+    )]
+    pub kamino_adapter: Box<Account<'info, KaminoAdapterState>>,
+}
+
 #[queue_computation_accounts("transfer_cvct", user)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
@@ -1712,4 +2153,10 @@ pub enum ErrorCode {
     CallbackAlreadyApplied,
     #[msg("Math operand out of safe range")]
     MathOperandOutOfRange,
+    #[msg("Insufficient idle vault liquidity for redeem settlement")]
+    InsufficientIdleLiquidity,
+    #[msg("Kamino adapter is disabled")]
+    KaminoAdapterDisabled,
+    #[msg("Invalid Kamino adapter configuration or account wiring")]
+    InvalidKaminoAdapterConfig,
 }

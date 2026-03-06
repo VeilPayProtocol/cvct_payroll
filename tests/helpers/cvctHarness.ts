@@ -637,12 +637,7 @@ export async function finalizeAndSettleDeposit(
   req: RequestResult,
 ): Promise<void> {
   const { harness } = fixture;
-  await awaitComputationFinalization(
-    harness.provider,
-    req.computationOffset,
-    harness.program.programId,
-    "confirmed",
-  );
+  await awaitOperationComputation(fixture, req);
 
   await rpcWithLogs(
     (harness.program.methods as any)
@@ -667,12 +662,7 @@ export async function finalizeAndSettleRedeem(
   req: RequestResult,
 ): Promise<void> {
   const { harness } = fixture;
-  await awaitComputationFinalization(
-    harness.provider,
-    req.computationOffset,
-    harness.program.programId,
-    "confirmed",
-  );
+  await awaitOperationComputation(fixture, req);
 
   await rpcWithLogs(
     (harness.program.methods as any)
@@ -689,6 +679,18 @@ export async function finalizeAndSettleRedeem(
       .rpc({ skipPreflight: true, commitment: "confirmed" }),
     "settleRedeem",
     harness.provider.connection,
+  );
+}
+
+export async function awaitOperationComputation(
+  fixture: Fixture,
+  req: RequestResult,
+): Promise<void> {
+  await awaitComputationFinalization(
+    fixture.harness.provider,
+    req.computationOffset,
+    fixture.harness.program.programId,
+    "confirmed",
   );
 }
 
