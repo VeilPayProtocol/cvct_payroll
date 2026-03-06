@@ -20,3 +20,15 @@ test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""
 
 [test]
 startup_wait = 60000000
+
+[[test.validator.account]]
+address = "BKyTcUe6daNG8HbgBix2ugdRHbykG2dK9hPBBqhUyoEX"
+filename = "tests/fixtures/kamino/accounts/global_config.json"
+
+[[test.genesis]]
+address = "KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd"
+program = "tests/fixtures/kamino/KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd.so"
+
+[[test.genesis]]
+address = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"
+program = "tests/fixtures/kamino/KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD.so"
