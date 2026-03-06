@@ -242,12 +242,14 @@ pub mod cvct {
 
         Ok(())
     }
-    pub fn request_deposit(
-        ctx: Context<RequestDeposit>,
+    pub fn request_deposit_intent(
+        ctx: Context<RequestDepositIntent>,
         computation_offset: u64,
         operation_id: u64,
         assets_in: u64,
+        min_shares_out: u64,
         quoted_shares_out: u64,
+        deadline_slot: u64,
         owner_enc_pubkey: [u8; 32],
         owner_balance_nonce: u128,
         owner_new_balance_nonce: u128,
@@ -259,26 +261,15 @@ pub mod cvct {
         vault_new_total_locked_nonce: u128,
     ) -> Result<()> {
         require!(assets_in > 0, ErrorCode::ZeroAmount);
+        require!(min_shares_out > 0, ErrorCode::ZeroAmount);
         require!(quoted_shares_out > 0, ErrorCode::ZeroAmount);
         require!(
-            assets_in <= MAX_SAFE_OPERAND_U64 && quoted_shares_out <= MAX_SAFE_OPERAND_U64,
+            assets_in <= MAX_SAFE_OPERAND_U64
+                && min_shares_out <= MAX_SAFE_OPERAND_U64
+                && quoted_shares_out <= MAX_SAFE_OPERAND_U64,
             ErrorCode::MathOperandOutOfRange
         );
-
-        // 1) Transfer backing tokens into the vault first.
-        //    Deposit share math (including inflation-attack defenses) is evaluated
-        //    in MPC and returned asynchronously in the callback.
-        transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.user_token_account.to_account_info(),
-                    to: ctx.accounts.vault_token_account.to_account_info(),
-                    authority: ctx.accounts.user.to_account_info(),
-                },
-            ),
-            assets_in,
-        )?;
+        require!(quoted_shares_out >= min_shares_out, ErrorCode::InvalidAmount);
 
         let pending_op = &mut ctx.accounts.pending_operation;
         pending_op.set_inner(PendingOperation {
@@ -293,7 +284,25 @@ pub mod cvct {
             computed_at_slot: 0,
             ok: false,
             amount_in: assets_in,
+            min_amount_out: min_shares_out,
             amount_out: 0,
+            deadline_slot,
+        });
+        let pending_result = &mut ctx.accounts.pending_deposit_result;
+        pending_result.set_inner(PendingDepositResult {
+            operation_id,
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            user: ctx.accounts.user.key(),
+            balance: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+            balance_nonce: 0,
+            total_supply: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+            total_supply_nonce: 0,
+            total_locked: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+            total_locked_nonce: 0,
+            ok: false,
+            shares_out: 0,
+            computed_at_slot: 0,
+            callback_applied: false,
         });
         emit!(OperationRequestedEvent {
             operation_id,
@@ -316,6 +325,8 @@ pub mod cvct {
             )
             // Plaintext amount.
             .plaintext_u128(assets_in as u128)
+            // User slippage floor.
+            .plaintext_u128(min_shares_out as u128)
             // Caller-provided quote to verify in MPC.
             .plaintext_u128(quoted_shares_out as u128)
             // Output encryption context for balance.
@@ -372,6 +383,10 @@ pub mod cvct {
                         pubkey: ctx.accounts.pending_operation.key(),
                         is_writable: true,
                     },
+                    CallbackAccount {
+                        pubkey: ctx.accounts.pending_deposit_result.key(),
+                        is_writable: true,
+                    },
                 ],
             )?],
             1,
@@ -403,18 +418,7 @@ pub mod cvct {
             Err(_) => return Err(ErrorCode::AbortedComputation.into()),
         };
 
-        let cvct_account = &mut ctx.accounts.cvct_account;
-        let cvct_mint = &mut ctx.accounts.cvct_mint;
-        let vault = &mut ctx.accounts.vault;
-
-        cvct_account.balance = balance.ciphertexts;
-        cvct_account.balance_nonce = balance.nonce;
-
-        cvct_mint.total_supply = total_supply.ciphertexts;
-        cvct_mint.total_supply_nonce = total_supply.nonce;
-
-        vault.total_locked = total_locked.ciphertexts;
-        vault.total_locked_nonce = total_locked.nonce;
+        let pending_result = &mut ctx.accounts.pending_deposit_result;
 
         let pending_op = &mut ctx.accounts.pending_operation;
         require!(
@@ -422,12 +426,34 @@ pub mod cvct {
             ErrorCode::InvalidOperationPhase
         );
         require!(!pending_op.callback_applied, ErrorCode::CallbackAlreadyApplied);
-        pending_op.ok = ok;
-        pending_op.amount_out = shares_out
+        require!(
+            pending_result.operation_id == pending_op.operation_id,
+            ErrorCode::InvalidPendingOperation
+        );
+        require!(
+            pending_result.cvct_mint == ctx.accounts.cvct_mint.key(),
+            ErrorCode::InvalidPendingOperation
+        );
+        require!(
+            pending_result.user == pending_op.user,
+            ErrorCode::InvalidPendingOperation
+        );
+        pending_result.balance = balance.ciphertexts;
+        pending_result.balance_nonce = balance.nonce;
+        pending_result.total_supply = total_supply.ciphertexts;
+        pending_result.total_supply_nonce = total_supply.nonce;
+        pending_result.total_locked = total_locked.ciphertexts;
+        pending_result.total_locked_nonce = total_locked.nonce;
+        pending_result.ok = ok;
+        pending_result.shares_out = shares_out
             .try_into()
             .map_err(|_| ErrorCode::InvalidAmount)?;
+        pending_result.computed_at_slot = Clock::get()?.slot;
+        pending_result.callback_applied = true;
+        pending_op.ok = ok;
+        pending_op.amount_out = pending_result.shares_out;
         pending_op.callback_applied = true;
-        pending_op.computed_at_slot = Clock::get()?.slot;
+        pending_op.computed_at_slot = pending_result.computed_at_slot;
         pending_op.status = if ok {
             STATUS_COMPUTED_SUCCESS
         } else {
@@ -443,7 +469,7 @@ pub mod cvct {
         Ok(())
     }
 
-    pub fn settle_deposit(ctx: Context<SettleDeposit>) -> Result<()> {
+    pub fn settle_deposit_commit(ctx: Context<SettleDepositCommit>) -> Result<()> {
         let pending_op = &mut ctx.accounts.pending_operation;
         if is_terminal_status(pending_op.status) {
             return Ok(());
@@ -458,41 +484,125 @@ pub mod cvct {
                 || pending_op.status == STATUS_COMPUTED_FAILURE,
             ErrorCode::InvalidOperationPhase
         );
+        let pending_result = &ctx.accounts.pending_deposit_result;
+        require!(
+            pending_result.operation_id == pending_op.operation_id,
+            ErrorCode::InvalidPendingOperation
+        );
+        require!(
+            pending_result.cvct_mint == ctx.accounts.cvct_mint.key(),
+            ErrorCode::InvalidPendingOperation
+        );
+        require!(
+            pending_result.user == ctx.accounts.user.key(),
+            ErrorCode::InvalidPendingOperation
+        );
+        require!(
+            pending_result.callback_applied,
+            ErrorCode::OperationNotComputed
+        );
+        require!(
+            pending_result.ok == pending_op.ok,
+            ErrorCode::InvalidPendingOperation
+        );
+        require!(
+            pending_result.shares_out == pending_op.amount_out,
+            ErrorCode::InvalidPendingOperation
+        );
+        require!(
+            pending_result.computed_at_slot == pending_op.computed_at_slot,
+            ErrorCode::InvalidPendingOperation
+        );
 
-        if pending_op.ok {
-            pending_op.status = OperationStatus::Settled as u8;
+        if !pending_op.ok {
+            pending_op.status = OperationStatus::Failed as u8;
             emit!(OperationSettledEvent {
                 operation_id: pending_op.operation_id,
                 kind: pending_op.kind,
                 final_status: pending_op.status,
-                amount_out: pending_op.amount_out,
+                amount_out: 0,
             });
             return Ok(());
         }
 
-        let cvct_mint_key = ctx.accounts.cvct_mint.key();
-        let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
-        let signer_seeds = &[&vault_seeds[..]];
-
         transfer(
-            CpiContext::new_with_signer(
+            CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
-                    from: ctx.accounts.vault_token_account.to_account_info(),
-                    to: ctx.accounts.user_token_account.to_account_info(),
-                    authority: ctx.accounts.vault.to_account_info(),
+                    from: ctx.accounts.user_token_account.to_account_info(),
+                    to: ctx.accounts.vault_token_account.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
                 },
-                signer_seeds,
             ),
             pending_op.amount_in,
         )?;
 
-        pending_op.status = OperationStatus::Refunded as u8;
+        let cvct_account = &mut ctx.accounts.cvct_account;
+        let cvct_mint = &mut ctx.accounts.cvct_mint;
+        let vault = &mut ctx.accounts.vault;
+
+        cvct_account.balance = pending_result.balance;
+        cvct_account.balance_nonce = pending_result.balance_nonce;
+        cvct_mint.total_supply = pending_result.total_supply;
+        cvct_mint.total_supply_nonce = pending_result.total_supply_nonce;
+        vault.total_locked = pending_result.total_locked;
+        vault.total_locked_nonce = pending_result.total_locked_nonce;
+
+        pending_op.status = OperationStatus::Settled as u8;
         emit!(OperationSettledEvent {
             operation_id: pending_op.operation_id,
             kind: pending_op.kind,
             final_status: pending_op.status,
-            amount_out: pending_op.amount_in,
+            amount_out: pending_op.amount_out,
+        });
+        Ok(())
+    }
+
+    pub fn cancel_deposit_intent(ctx: Context<CancelDepositIntent>) -> Result<()> {
+        let pending_op = &mut ctx.accounts.pending_operation;
+        require!(
+            pending_op.kind == OperationKind::Deposit as u8,
+            ErrorCode::InvalidOperationKind
+        );
+        require!(
+            pending_op.status == OperationStatus::Requested as u8,
+            ErrorCode::InvalidOperationPhase
+        );
+        require!(!pending_op.callback_applied, ErrorCode::InvalidOperationPhase);
+
+        pending_op.status = OperationStatus::Cancelled as u8;
+        emit!(OperationSettledEvent {
+            operation_id: pending_op.operation_id,
+            kind: pending_op.kind,
+            final_status: pending_op.status,
+            amount_out: 0,
+        });
+        Ok(())
+    }
+
+    pub fn expire_deposit_intent(ctx: Context<ExpireDepositIntent>) -> Result<()> {
+        let pending_op = &mut ctx.accounts.pending_operation;
+        require!(
+            pending_op.kind == OperationKind::Deposit as u8,
+            ErrorCode::InvalidOperationKind
+        );
+        require!(
+            pending_op.status == OperationStatus::Requested as u8,
+            ErrorCode::InvalidOperationPhase
+        );
+        require!(!pending_op.callback_applied, ErrorCode::InvalidOperationPhase);
+        require!(pending_op.deadline_slot > 0, ErrorCode::InvalidAmount);
+        require!(
+            Clock::get()?.slot > pending_op.deadline_slot,
+            ErrorCode::InvalidOperationPhase
+        );
+
+        pending_op.status = OperationStatus::Expired as u8;
+        emit!(OperationSettledEvent {
+            operation_id: pending_op.operation_id,
+            kind: pending_op.kind,
+            final_status: pending_op.status,
+            amount_out: 0,
         });
         Ok(())
     }
@@ -533,7 +643,9 @@ pub mod cvct {
             computed_at_slot: 0,
             ok: false,
             amount_in: shares_in,
+            min_amount_out: 0,
             amount_out: 0,
+            deadline_slot: 0,
         });
         emit!(OperationRequestedEvent {
             operation_id,
@@ -1103,6 +1215,8 @@ pub enum OperationStatus {
     Settled = 3,
     Refunded = 4,
     Failed = 5,
+    Cancelled = 6,
+    Expired = 7,
 }
 
 #[account]
@@ -1119,12 +1233,38 @@ pub struct PendingOperation {
     pub ok: bool,
     /// Assets in for deposits, shares in for redeems.
     pub amount_in: u64,
+    /// Minimum shares out for deposits, zero for redeems.
+    pub min_amount_out: u64,
     /// Shares out for deposits, assets out for redeems.
     pub amount_out: u64,
+    /// Deadline slot for deposits, zero for redeems.
+    pub deadline_slot: u64,
 }
 
 impl PendingOperation {
-    pub const LEN: usize = 8 + (32 * 4) + 1 + 1 + 1 + 8 + 1 + 8 + 8;
+    pub const LEN: usize = 8 + (32 * 4) + 1 + 1 + 1 + 8 + 1 + 8 + 8 + 8 + 8;
+}
+
+#[account]
+pub struct PendingDepositResult {
+    pub operation_id: u64,
+    pub cvct_mint: Pubkey,
+    pub user: Pubkey,
+    pub balance: [[u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+    pub balance_nonce: u128,
+    pub total_supply: [[u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+    pub total_supply_nonce: u128,
+    pub total_locked: [[u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+    pub total_locked_nonce: u128,
+    pub ok: bool,
+    pub shares_out: u64,
+    pub computed_at_slot: u64,
+    pub callback_applied: bool,
+}
+
+impl PendingDepositResult {
+    pub const LEN: usize =
+        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -1162,6 +1302,8 @@ fn is_terminal_status(status: u8) -> bool {
     status == OperationStatus::Settled as u8
         || status == OperationStatus::Refunded as u8
         || status == OperationStatus::Failed as u8
+        || status == OperationStatus::Cancelled as u8
+        || status == OperationStatus::Expired as u8
 }
 
 #[event]
@@ -1397,7 +1539,7 @@ pub struct InitAccountStateCallback<'info> {
 #[queue_computation_accounts("deposit_and_mint", user)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64, operation_id: u64)]
-pub struct RequestDeposit<'info> {
+pub struct RequestDepositIntent<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(
@@ -1470,12 +1612,12 @@ pub struct RequestDeposit<'info> {
         constraint = user_token_account.mint == cvct_mint.backing_mint,
         constraint = user_token_account.owner == user.key(),
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: Box<Account<'info, TokenAccount>>,
     #[account(
         mut,
         constraint = vault_token_account.key() == vault.backing_token_account,
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: Box<Account<'info, TokenAccount>>,
     #[account(
         init,
         payer = user,
@@ -1489,6 +1631,19 @@ pub struct RequestDeposit<'info> {
         bump,
     )]
     pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(
+        init,
+        payer = user,
+        space = 8 + PendingDepositResult::LEN,
+        seeds = [
+            b"pending_deposit_result",
+            cvct_mint.key().as_ref(),
+            user.key().as_ref(),
+            operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_deposit_result: Box<Account<'info, PendingDepositResult>>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -1531,6 +1686,17 @@ pub struct DepositAndMintCallback<'info> {
         constraint = pending_operation.kind == OperationKind::Deposit as u8 @ ErrorCode::InvalidOperationKind,
     )]
     pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(
+        mut,
+        seeds = [
+            b"pending_deposit_result",
+            cvct_mint.key().as_ref(),
+            pending_operation.user.as_ref(),
+            pending_operation.operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_deposit_result: Box<Account<'info, PendingDepositResult>>,
 }
 
 #[queue_computation_accounts("burn_and_withdraw", user)]
@@ -1673,9 +1839,9 @@ pub struct BurnAndWithdrawCallback<'info> {
 }
 
 #[derive(Accounts)]
-pub struct SettleDeposit<'info> {
+pub struct SettleDepositCommit<'info> {
     #[account(mut)]
-    pub executor: Signer<'info>,
+    pub user: Signer<'info>,
     #[account(mut)]
     pub cvct_mint: Box<Account<'info, CvctMint>>,
     #[account(
@@ -1689,15 +1855,88 @@ pub struct SettleDeposit<'info> {
         mut,
         constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
         constraint = pending_operation.kind == OperationKind::Deposit as u8 @ ErrorCode::InvalidOperationKind,
+        constraint = pending_operation.user == user.key() @ ErrorCode::Unauthorized,
         constraint = pending_operation.user_token_account == user_token_account.key() @ ErrorCode::InvalidPendingOperation,
         constraint = pending_operation.vault_token_account == vault_token_account.key() @ ErrorCode::InvalidPendingOperation,
     )]
     pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(
+        constraint = pending_deposit_result.callback_applied @ ErrorCode::OperationNotComputed,
+        seeds = [
+            b"pending_deposit_result",
+            cvct_mint.key().as_ref(),
+            user.key().as_ref(),
+            pending_operation.operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_deposit_result: Box<Account<'info, PendingDepositResult>>,
+    #[account(
+        mut,
+        seeds = [b"cvct_account", cvct_mint.key().as_ref(), user.key().as_ref()],
+        bump,
+        constraint = cvct_account.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = cvct_account.owner == user.key() @ ErrorCode::Unauthorized,
+    )]
+    pub cvct_account: Box<Account<'info, CvctAccount>>,
     #[account(mut, constraint = vault_token_account.key() == vault.backing_token_account)]
     pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut, constraint = user_token_account.mint == cvct_mint.backing_mint)]
+    #[account(
+        mut,
+        constraint = user_token_account.mint == cvct_mint.backing_mint,
+        constraint = user_token_account.owner == user.key() @ ErrorCode::Unauthorized
+    )]
     pub user_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct CancelDepositIntent<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.user == user.key() @ ErrorCode::Unauthorized,
+        constraint = pending_operation.kind == OperationKind::Deposit as u8 @ ErrorCode::InvalidOperationKind,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(
+        mut,
+        seeds = [
+            b"pending_deposit_result",
+            cvct_mint.key().as_ref(),
+            user.key().as_ref(),
+            pending_operation.operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_deposit_result: Box<Account<'info, PendingDepositResult>>,
+}
+
+#[derive(Accounts)]
+pub struct ExpireDepositIntent<'info> {
+    #[account(mut)]
+    pub executor: Signer<'info>,
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.kind == OperationKind::Deposit as u8 @ ErrorCode::InvalidOperationKind,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(
+        mut,
+        seeds = [
+            b"pending_deposit_result",
+            cvct_mint.key().as_ref(),
+            pending_operation.user.as_ref(),
+            pending_operation.operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_deposit_result: Box<Account<'info, PendingDepositResult>>,
 }
 
 #[derive(Accounts)]

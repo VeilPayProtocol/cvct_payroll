@@ -39,6 +39,7 @@ mod circuits {
     pub fn deposit_and_mint(
         balance: Enc<Shared, u128>,
         amount: u128,
+        min_shares: u128,
         quoted_shares: u128,
         owner_out: Shared,
         total_supply: Enc<Shared, u128>,
@@ -66,13 +67,18 @@ mod circuits {
         let safe_operands = supply <= MAX_SAFE_OPERAND
             && locked <= MAX_SAFE_OPERAND
             && amount <= MAX_SAFE_OPERAND
+            && min_shares <= MAX_SAFE_OPERAND
             && quoted_shares <= MAX_SAFE_OPERAND;
         let ratio_valid = supply == 0 || locked > 0;
         let lhs = quoted_shares * (locked + VIRTUAL_ASSET_OFFSET);
         let rhs = amount * (supply + VIRTUAL_SHARE_OFFSET);
         let upper = (quoted_shares + 1) * (locked + VIRTUAL_ASSET_OFFSET);
         let quote_valid = lhs <= rhs && upper > rhs;
-        let ok = safe_operands && ratio_valid && quoted_shares > 0 && quote_valid;
+        let ok = safe_operands
+            && ratio_valid
+            && quoted_shares > 0
+            && quoted_shares >= min_shares
+            && quote_valid;
 
         let new_balance = if ok { bal + quoted_shares } else { bal };
         let new_total_supply = if ok { supply + quoted_shares } else { supply };

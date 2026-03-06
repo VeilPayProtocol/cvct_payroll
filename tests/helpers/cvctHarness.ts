@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { PublicKey } from "@solana/web3.js";
+import { ComputeBudgetProgram, PublicKey } from "@solana/web3.js";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -9,6 +9,7 @@ import {
   getAssociatedTokenAddress,
   getOrCreateAssociatedTokenAccount,
   mintTo,
+  transfer,
 } from "@solana/spl-token";
 import { randomBytes } from "crypto";
 import {
@@ -94,7 +95,9 @@ export type Fixture = {
 
 export type RequestResult = {
   operationPda: PublicKey;
+  depositResultPda?: PublicKey;
   computationOffset: anchor.BN;
+  deadlineSlot?: anchor.BN;
 };
 
 function randomNonce(): { bytes: Uint8Array; bn: anchor.BN } {
@@ -288,6 +291,9 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
         authorityNonce.bn,
         vaultNonce.bn,
       )
+      .preInstructions([
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+      ])
       .accountsPartial({
         authority: authoritySigner.publicKey,
         cvctMint: cvctMintPda,
@@ -348,6 +354,9 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
         Array.from(accountEncPubkey),
         accountNonce.bn,
       )
+      .preInstructions([
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+      ])
       .accountsPartial({
         owner: harness.payer.publicKey,
         cvctAccount: cvctAccountPda,
@@ -410,6 +419,9 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
         Array.from(recipientEncPubkey),
         recipientNonce.bn,
       )
+      .preInstructions([
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+      ])
       .accountsPartial({
         owner: recipient.publicKey,
         cvctAccount: recipientCvctAccountPda,
@@ -471,7 +483,8 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
 export async function requestDeposit(
   fixture: Fixture,
   assetsIn: number,
-  quotedSharesOut: number,
+  minSharesOut: number,
+  options?: { quotedSharesOut?: number; deadlineSlot?: anchor.BN },
 ): Promise<RequestResult> {
   const { harness } = fixture;
   const cvctMintBefore = await harness.program.account.cvctMint.fetch(
@@ -493,19 +506,33 @@ export async function requestDeposit(
     ],
     harness.program.programId,
   );
+  const [depositResultPda] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pending_deposit_result"),
+      fixture.cvctMintPda.toBuffer(),
+      harness.payer.publicKey.toBuffer(),
+      Buffer.from(operationId.toArray("le", 8)),
+    ],
+    harness.program.programId,
+  );
 
   const newBalanceNonce = randomNonce();
   const newSupplyNonce = randomNonce();
   const newLockedNonce = randomNonce();
   const compDefOffset = getCompDefAccOffset(COMP_DEF_DEPOSIT);
+  const quotedSharesOut = options?.quotedSharesOut ?? minSharesOut;
+  const slot = await harness.connection.getSlot("confirmed");
+  const deadlineSlot = options?.deadlineSlot ?? new anchor.BN(slot + 500);
 
   await rpcWithLogs(
     (harness.program.methods as any)
-      .requestDeposit(
+      .requestDepositIntent(
         computationOffset,
         operationId,
         new anchor.BN(assetsIn),
+        new anchor.BN(minSharesOut),
         new anchor.BN(quotedSharesOut),
+        deadlineSlot,
         Array.from(fixture.accountEncPubkey),
         accountBefore.balanceNonce,
         newBalanceNonce.bn,
@@ -524,6 +551,7 @@ export async function requestDeposit(
         userTokenAccount: fixture.userTokenAccount,
         vaultTokenAccount: fixture.vaultTokenAccount,
         pendingOperation: operationPda,
+        pendingDepositResult: depositResultPda,
         tokenProgram: TOKEN_PROGRAM_ID,
         mxeAccount: getMXEAccAddress(harness.program.programId),
         mempoolAccount: getMempoolAccAddress(harness.arciumEnv.arciumClusterOffset),
@@ -543,11 +571,11 @@ export async function requestDeposit(
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "requestDeposit",
+    "requestDepositIntent",
     harness.provider.connection,
   );
 
-  return { operationPda, computationOffset };
+  return { operationPda, depositResultPda, computationOffset, deadlineSlot };
 }
 
 export async function requestRedeem(
@@ -641,18 +669,20 @@ export async function finalizeAndSettleDeposit(
 
   await rpcWithLogs(
     (harness.program.methods as any)
-      .settleDeposit()
+      .settleDepositCommit()
       .accountsPartial({
-        executor: harness.payer.publicKey,
+        user: harness.payer.publicKey,
         cvctMint: fixture.cvctMintPda,
         vault: fixture.vaultPda,
         pendingOperation: req.operationPda,
+        pendingDepositResult: req.depositResultPda,
         vaultTokenAccount: fixture.vaultTokenAccount,
         userTokenAccount: fixture.userTokenAccount,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
+      .signers([harness.payer.payer])
       .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "settleDeposit",
+    "settleDepositCommit",
     harness.provider.connection,
   );
 }
@@ -837,6 +867,43 @@ export async function fetchPendingStatus(
   return op.status;
 }
 
+export async function fetchPendingDepositResult(
+  fixture: Fixture,
+  resultPda: PublicKey,
+): Promise<any> {
+  return (fixture.harness.program.account as any).pendingDepositResult.fetch(resultPda);
+}
+
+export async function fetchUserBackingBalance(fixture: Fixture): Promise<number> {
+  const user = await getAccount(
+    fixture.harness.provider.connection,
+    fixture.userTokenAccount,
+  );
+  return Number(user.amount);
+}
+
+export async function drainUserBackingTokens(
+  fixture: Fixture,
+  amount: number,
+): Promise<void> {
+  const destinationOwner = anchor.web3.Keypair.generate();
+  const destination = await getOrCreateAssociatedTokenAccount(
+    fixture.harness.connection,
+    fixture.harness.payer.payer,
+    fixture.backingMint,
+    destinationOwner.publicKey,
+  );
+
+  await transfer(
+    fixture.harness.connection,
+    fixture.harness.payer.payer,
+    fixture.userTokenAccount,
+    destination.address,
+    fixture.harness.payer.payer,
+    amount,
+  );
+}
+
 export async function assertEarlySettleRejected(
   settlePromise: Promise<unknown>,
 ): Promise<void> {
@@ -880,17 +947,53 @@ export async function assertTokenBalances(
 export async function settleDepositCall(
   fixture: Fixture,
   operationPda: PublicKey,
+  depositResultPda?: PublicKey,
 ): Promise<unknown> {
   return (fixture.harness.program.methods as any)
-    .settleDeposit()
+    .settleDepositCommit()
     .accountsPartial({
-      executor: fixture.harness.payer.publicKey,
+      user: fixture.harness.payer.publicKey,
       cvctMint: fixture.cvctMintPda,
       vault: fixture.vaultPda,
       pendingOperation: operationPda,
+      pendingDepositResult: depositResultPda,
       vaultTokenAccount: fixture.vaultTokenAccount,
       userTokenAccount: fixture.userTokenAccount,
       tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .signers([fixture.harness.payer.payer])
+    .rpc({ skipPreflight: true, commitment: "confirmed" });
+}
+
+export async function cancelDepositIntentCall(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  depositResultPda?: PublicKey,
+): Promise<unknown> {
+  return (fixture.harness.program.methods as any)
+    .cancelDepositIntent()
+    .accountsPartial({
+      user: fixture.harness.payer.publicKey,
+      cvctMint: fixture.cvctMintPda,
+      pendingOperation: operationPda,
+      pendingDepositResult: depositResultPda,
+    })
+    .signers([fixture.harness.payer.payer])
+    .rpc({ skipPreflight: true, commitment: "confirmed" });
+}
+
+export async function expireDepositIntentCall(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  depositResultPda?: PublicKey,
+): Promise<unknown> {
+  return (fixture.harness.program.methods as any)
+    .expireDepositIntent()
+    .accountsPartial({
+      executor: fixture.harness.payer.publicKey,
+      cvctMint: fixture.cvctMintPda,
+      pendingOperation: operationPda,
+      pendingDepositResult: depositResultPda,
     })
     .rpc({ skipPreflight: true, commitment: "confirmed" });
 }
@@ -1181,6 +1284,9 @@ async function rpcWithLogs<T>(
   try {
     return await promise;
   } catch (err) {
+    if (process.env.CVCT_DEBUG_RPC_LOGS !== "1") {
+      throw err;
+    }
     const maybeLogs =
       (err as { logs?: string[] }).logs ||
       (err as { transactionError?: { logs?: string[] } }).transactionError?.logs;
