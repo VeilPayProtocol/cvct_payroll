@@ -1228,6 +1228,13 @@ pub mod cvct {
         total_locked_nonce: u128,
     ) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
+        // Identical ciphertext+nonce is a pure refresh no-op. Only a real encrypted
+        // state change should advance pricing_version and invalidate staged ops.
+        if vault.total_locked[0] == total_locked_ciphertext
+            && vault.total_locked_nonce == total_locked_nonce
+        {
+            return Ok(());
+        }
         vault.total_locked = [total_locked_ciphertext];
         vault.total_locked_nonce = total_locked_nonce;
         ctx.accounts.pricing_state.pricing_version = ctx
@@ -1246,6 +1253,13 @@ pub mod cvct {
         total_locked_nonce: u128,
     ) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
+        // Identical ciphertext+nonce is a pure refresh no-op. Any changed
+        // ciphertext or nonce is treated as a real pricing-state update.
+        if vault.total_locked[0] == total_locked_ciphertext
+            && vault.total_locked_nonce == total_locked_nonce
+        {
+            return Ok(());
+        }
         vault.total_locked = [total_locked_ciphertext];
         vault.total_locked_nonce = total_locked_nonce;
         ctx.accounts.pricing_state.pricing_version = ctx

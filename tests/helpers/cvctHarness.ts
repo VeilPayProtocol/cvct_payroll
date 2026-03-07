@@ -1047,6 +1047,28 @@ export async function syncTotalAssetsNoop(fixture: Fixture): Promise<void> {
   );
 }
 
+export async function syncTotalAssetsChanged(fixture: Fixture): Promise<void> {
+  const { harness } = fixture;
+  const vault = await harness.program.account.vault.fetch(fixture.vaultPda);
+  await rpcWithLogs(
+    (harness.program.methods as any)
+      .syncTotalAssets(
+        Array.from(vault.totalLocked[0]),
+        new anchor.BN(vault.totalLockedNonce.toString()).addn(1),
+      )
+      .accountsPartial({
+        authority: fixture.authoritySigner.publicKey,
+        cvctMint: fixture.cvctMintPda,
+        pricingState: fixture.pricingStatePda,
+        vault: fixture.vaultPda,
+      })
+      .signers([fixture.authoritySigner])
+      .rpc(TEST_RPC_OPTIONS),
+    "syncTotalAssetsChanged",
+    harness.provider.connection,
+  );
+}
+
 export async function fetchPendingStatus(
   fixture: Fixture,
   operationPda: PublicKey,

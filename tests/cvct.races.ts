@@ -30,6 +30,7 @@ import {
   requestTransferCvct,
   settleDepositCall,
   settleRedeemCall,
+  syncTotalAssetsChanged,
   syncTotalAssetsNoop,
   transferCvct,
   waitForPendingDepositCallback,
@@ -120,15 +121,41 @@ describe("Cvct Races", () => {
     );
   });
 
-  it("[deposit] invalidates staged settle after sync version change", async () => {
+  it("[deposit] preserves staged settle after no-op sync", async () => {
     const fixture = await createFixture(harness);
     const quote = previewDepositShares(fixture.depositAmount, 0, 0);
     const req = await requestDeposit(fixture, fixture.depositAmount, quote);
     await awaitOperationComputation(fixture, req);
-    const beforeState = await getDecryptedState(fixture);
+    const versionBeforeSync = await fetchPricingVersion(fixture);
 
     await syncTotalAssetsNoop(fixture);
     const versionAfterSync = await fetchPricingVersion(fixture);
+    expect(versionAfterSync).to.equal(versionBeforeSync);
+    expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(
+      STATUS_COMPUTED_SUCCESS,
+    );
+    await settleDepositCall(fixture, req.operationPda, req.depositResultPda);
+
+    expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(
+      STATUS_SETTLED,
+    );
+    await assertTokenBalances(
+      fixture,
+      1_000_000 - fixture.depositAmount,
+      fixture.depositAmount,
+    );
+  });
+
+  it("[deposit] invalidates staged settle after changed sync version", async () => {
+    const fixture = await createFixture(harness);
+    const quote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const req = await requestDeposit(fixture, fixture.depositAmount, quote);
+    await awaitOperationComputation(fixture, req);
+
+    const versionBeforeSync = await fetchPricingVersion(fixture);
+    await syncTotalAssetsChanged(fixture);
+    const versionAfterSync = await fetchPricingVersion(fixture);
+    expect(versionAfterSync).to.equal(versionBeforeSync + 1);
     await settleDepositCall(fixture, req.operationPda, req.depositResultPda);
 
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(
@@ -136,10 +163,6 @@ describe("Cvct Races", () => {
     );
     expect(await fetchPricingVersion(fixture)).to.equal(versionAfterSync);
     await assertTokenBalances(fixture, 1_000_000, 0);
-    const afterState = await getDecryptedState(fixture);
-    expect(afterState.decryptedBalance).to.equal(beforeState.decryptedBalance);
-    expect(afterState.decryptedSupply).to.equal(beforeState.decryptedSupply);
-    expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
   });
 
   it("[redeem] rejects mismatched staged result wiring before custody movement", async () => {
@@ -199,7 +222,7 @@ describe("Cvct Races", () => {
     expect(await fetchPricingVersion(fixture)).to.equal(versionAfterA);
   });
 
-  it("[redeem] invalidates staged settle after sync version change", async () => {
+  it("[redeem] preserves staged settle after no-op sync", async () => {
     const fixture = await createFixture(harness);
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
@@ -212,10 +235,44 @@ describe("Cvct Races", () => {
     );
     const req = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
     await awaitOperationComputation(fixture, req);
-    const beforeState = await getDecryptedState(fixture);
+    const versionBeforeSync = await fetchPricingVersion(fixture);
 
     await syncTotalAssetsNoop(fixture);
     const versionAfterSync = await fetchPricingVersion(fixture);
+    expect(versionAfterSync).to.equal(versionBeforeSync);
+    expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(
+      STATUS_COMPUTED_SUCCESS,
+    );
+    await settleRedeemCall(fixture, req.operationPda, req.redeemResultPda);
+
+    expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(
+      STATUS_SETTLED,
+    );
+    await assertTokenBalances(
+      fixture,
+      1_000_000 - fixture.depositAmount + fixture.burnAmount,
+      fixture.depositAmount - fixture.burnAmount,
+    );
+  });
+
+  it("[redeem] invalidates staged settle after changed sync version", async () => {
+    const fixture = await createFixture(harness);
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const req = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    await awaitOperationComputation(fixture, req);
+
+    const versionBeforeSync = await fetchPricingVersion(fixture);
+    await syncTotalAssetsChanged(fixture);
+    const versionAfterSync = await fetchPricingVersion(fixture);
+    expect(versionAfterSync).to.equal(versionBeforeSync + 1);
     await settleRedeemCall(fixture, req.operationPda, req.redeemResultPda);
 
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(
@@ -227,10 +284,6 @@ describe("Cvct Races", () => {
       1_000_000 - fixture.depositAmount,
       fixture.depositAmount,
     );
-    const afterState = await getDecryptedState(fixture);
-    expect(afterState.decryptedBalance).to.equal(beforeState.decryptedBalance);
-    expect(afterState.decryptedSupply).to.equal(beforeState.decryptedSupply);
-    expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
   });
 
   it("[deposit] invalidates when transfer updates user balance before callback", async () => {

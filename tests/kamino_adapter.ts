@@ -5,6 +5,8 @@ import {
   createFixture,
   createHarness,
   expectRpcFailure,
+  fetchPendingStatus,
+  fetchPricingVersion,
   finalizeAndSettleDeposit,
   getDecryptedState,
   previewDepositShares,
@@ -304,5 +306,91 @@ describe("Cvct Kamino Adapter", () => {
 
     const state = await getDecryptedState(fixture);
     expect(state.decryptedLocked).to.equal(BigInt(fixture.depositAmount));
+  });
+
+  itLocalOnly("no-op adapter sync preserves staged redeem settleability", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+    const kamino = await bootstrapKaminoVault(fixture);
+    const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    await awaitOperationComputation(fixture, redeemReq);
+
+    const versionBeforeSync = await fetchPricingVersion(fixture);
+    const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
+    await runLabeledRpc(harness, "syncTotalAssetsFromAdapterNoop", () =>
+      (harness.program.methods as any)
+        .syncTotalAssetsFromAdapter(
+          Array.from(vaultBefore.totalLocked[0]),
+          vaultBefore.totalLockedNonce,
+        )
+        .accountsPartial({
+          authority: fixture.authoritySigner.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          pricingState: fixture.pricingStatePda,
+          vault: fixture.vaultPda,
+          kaminoAdapter: kaminoAdapterPda,
+        })
+        .signers([fixture.authoritySigner])
+        .rpc(TEST_RPC_OPTIONS),
+    );
+
+    expect(await fetchPricingVersion(fixture)).to.equal(versionBeforeSync);
+    expect(await fetchPendingStatus(fixture, redeemReq.operationPda)).to.equal(1);
+
+    await settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda);
+    expect(await fetchPendingStatus(fixture, redeemReq.operationPda)).to.equal(3);
+  });
+
+  itLocalOnly("changed adapter sync still invalidates staged redeem", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+    const kamino = await bootstrapKaminoVault(fixture);
+    const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    await awaitOperationComputation(fixture, redeemReq);
+
+    const versionBeforeSync = await fetchPricingVersion(fixture);
+    const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
+    await runLabeledRpc(harness, "syncTotalAssetsFromAdapterChanged", () =>
+      (harness.program.methods as any)
+        .syncTotalAssetsFromAdapter(
+          Array.from(vaultBefore.totalLocked[0]),
+          new anchor.BN(vaultBefore.totalLockedNonce.toString()).addn(1),
+        )
+        .accountsPartial({
+          authority: fixture.authoritySigner.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          pricingState: fixture.pricingStatePda,
+          vault: fixture.vaultPda,
+          kaminoAdapter: kaminoAdapterPda,
+        })
+        .signers([fixture.authoritySigner])
+        .rpc(TEST_RPC_OPTIONS),
+    );
+
+    expect(await fetchPricingVersion(fixture)).to.equal(versionBeforeSync + 1);
+    await settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda);
+    expect(await fetchPendingStatus(fixture, redeemReq.operationPda)).to.equal(8);
   });
 });
