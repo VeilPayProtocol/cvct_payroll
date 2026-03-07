@@ -2,7 +2,6 @@ import * as anchor from "@coral-xyz/anchor";
 import { expect } from "chai";
 import {
   accountExists,
-  assertEarlySettleRejected,
   assertEncryptedTotals,
   assertTerminalNoopOnResettle,
   assertTokenBalances,

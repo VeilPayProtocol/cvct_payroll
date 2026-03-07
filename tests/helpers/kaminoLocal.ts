@@ -43,17 +43,6 @@ export function shouldRunKaminoLocalTests(): boolean {
   return process.env.CVCT_RUN_KAMINO_LOCAL === "1";
 }
 
-export type KaminoAdapterConfig = {
-  kaminoProgram: PublicKey;
-  klendProgram: PublicKey;
-  vaultState: PublicKey;
-  globalConfig: PublicKey;
-  baseVaultAuthority: PublicKey;
-  tokenVault: PublicKey;
-  sharesMint: PublicKey;
-  eventAuthority: PublicKey;
-};
-
 export type KaminoVaultContext = {
   vaultState: Keypair;
   baseVaultAuthority: PublicKey;
@@ -326,7 +315,6 @@ export async function configureCvctKaminoAdapter(
   await runLabeledRpc(fixture.harness, "configureKaminoAdapter", () =>
     (fixture.harness.program.methods as any)
       .configureKaminoAdapter({
-        kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
         klendProgram: KAMINO_KLEND_PROGRAM_ID,
         vaultState: kamino.vaultState.publicKey,
         globalConfig: kamino.globalConfig,

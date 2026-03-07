@@ -1065,29 +1065,25 @@ pub mod cvct {
         ctx: Context<ConfigureKaminoAdapter>,
         config: KaminoAdapterConfigArgs,
     ) -> Result<()> {
-        require!(
-            config.kamino_program == KAMINO_VAULT_ID,
-            ErrorCode::InvalidKaminoAdapterConfig
-        );
         let (expected_base_vault_authority, _) = Pubkey::find_program_address(
             &[KAMINO_BASE_VAULT_AUTHORITY_SEED, config.vault_state.as_ref()],
-            &config.kamino_program,
+            &KAMINO_VAULT_ID,
         );
         let (expected_token_vault, _) = Pubkey::find_program_address(
             &[KAMINO_TOKEN_VAULT_SEED, config.vault_state.as_ref()],
-            &config.kamino_program,
+            &KAMINO_VAULT_ID,
         );
         let (expected_shares_mint, _) = Pubkey::find_program_address(
             &[KAMINO_SHARES_SEED, config.vault_state.as_ref()],
-            &config.kamino_program,
+            &KAMINO_VAULT_ID,
         );
         let (expected_event_authority, _) = Pubkey::find_program_address(
             &[KAMINO_EVENT_AUTHORITY_SEED],
-            &config.kamino_program,
+            &KAMINO_VAULT_ID,
         );
         let (expected_global_config, _) = Pubkey::find_program_address(
             &[KAMINO_GLOBAL_CONFIG_STATE_SEED],
-            &config.kamino_program,
+            &KAMINO_VAULT_ID,
         );
 
         require!(
@@ -1113,7 +1109,6 @@ pub mod cvct {
 
         let adapter = &mut ctx.accounts.kamino_adapter;
         adapter.cvct_mint = ctx.accounts.cvct_mint.key();
-        adapter.kamino_program = config.kamino_program;
         adapter.klend_program = config.klend_program;
         adapter.vault_state = config.vault_state;
         adapter.global_config = config.global_config;
@@ -1520,8 +1515,6 @@ pub enum OperationStatus {
     ComputedSuccess = 1,
     ComputedFailure = 2,
     Settled = 3,
-    /// Legacy v1 status retained for backward-compatible decoding only.
-    Refunded = 4,
     Failed = 5,
     Cancelled = 6,
     Expired = 7,
@@ -1626,7 +1619,6 @@ impl PendingTransferResult {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct KaminoAdapterConfigArgs {
-    pub kamino_program: Pubkey,
     pub klend_program: Pubkey,
     pub vault_state: Pubkey,
     pub global_config: Pubkey,
@@ -1640,7 +1632,6 @@ pub struct KaminoAdapterConfigArgs {
 #[account]
 pub struct KaminoAdapterState {
     pub cvct_mint: Pubkey,
-    pub kamino_program: Pubkey,
     pub klend_program: Pubkey,
     pub vault_state: Pubkey,
     pub global_config: Pubkey,
@@ -1652,12 +1643,11 @@ pub struct KaminoAdapterState {
 }
 
 impl KaminoAdapterState {
-    pub const LEN: usize = (32 * 9) + 1;
+    pub const LEN: usize = (32 * 8) + 1;
 }
 
 fn is_terminal_status(status: u8) -> bool {
     status == OperationStatus::Settled as u8
-        || status == OperationStatus::Refunded as u8
         || status == OperationStatus::Failed as u8
         || status == OperationStatus::Cancelled as u8
         || status == OperationStatus::Expired as u8
@@ -2599,7 +2589,6 @@ pub struct KaminoDepositIdle<'info> {
     /// CHECK: validated against adapter state.
     #[account(
         address = KAMINO_VAULT_ID,
-        constraint = kamino_program.key() == kamino_adapter.kamino_program @ ErrorCode::InvalidKaminoAdapterConfig
     )]
     pub kamino_program: UncheckedAccount<'info>,
     /// CHECK: validated against adapter state.
@@ -2685,7 +2674,6 @@ pub struct KaminoWithdrawToVault<'info> {
     /// CHECK: validated against adapter state.
     #[account(
         address = KAMINO_VAULT_ID,
-        constraint = kamino_program.key() == kamino_adapter.kamino_program @ ErrorCode::InvalidKaminoAdapterConfig
     )]
     pub kamino_program: UncheckedAccount<'info>,
     /// CHECK: validated against adapter state.

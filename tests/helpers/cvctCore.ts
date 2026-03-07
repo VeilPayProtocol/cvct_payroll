@@ -50,7 +50,6 @@ const VIRTUAL_SHARE_OFFSET = 1;
  * 3) Use flow helpers (`request*`, `finalizeAndSettle*`, `transferCvct`) instead of
  *    inlining account wiring in test files.
  * 4) Use assertion helpers for common guarantees:
- *    - `assertEarlySettleRejected`
  *    - `assertTerminalNoopOnResettle`
  *    - `assertEncryptedTotals`
  *    - `assertTokenBalances`
@@ -1158,12 +1157,6 @@ export async function drainUserBackingTokens(
     fixture.harness.payer.payer,
     amount,
   );
-}
-
-export async function assertEarlySettleRejected(
-  settlePromise: Promise<unknown>,
-): Promise<void> {
-  await expectRpcFailure(settlePromise, "Operation has not been computed yet");
 }
 
 export async function assertTerminalNoopOnResettle(

@@ -1,6 +1,5 @@
 export {
   accountExists,
-  assertEarlySettleRejected,
   assertEncryptedTotals,
   assertTerminalNoopOnResettle,
   assertTokenBalances,

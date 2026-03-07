@@ -63,7 +63,6 @@ describe("Cvct Kamino Adapter", () => {
     await runLabeledRpc(harness, "configureKaminoAdapter", () =>
       (harness.program.methods as any)
         .configureKaminoAdapter({
-          kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
           klendProgram: KAMINO_KLEND_PROGRAM_ID,
           vaultState,
           globalConfig: pdas.globalConfig,
@@ -106,7 +105,6 @@ describe("Cvct Kamino Adapter", () => {
     await expectRpcFailure(
       (harness.program.methods as any)
         .configureKaminoAdapter({
-          kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
           klendProgram: KAMINO_KLEND_PROGRAM_ID,
           vaultState,
           globalConfig: anchor.web3.Keypair.generate().publicKey,
@@ -169,7 +167,6 @@ describe("Cvct Kamino Adapter", () => {
     await runLabeledRpc(harness, "disableKaminoAdapter", () =>
       (harness.program.methods as any)
         .configureKaminoAdapter({
-          kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
           klendProgram: KAMINO_KLEND_PROGRAM_ID,
           vaultState: kamino.vaultState.publicKey,
           globalConfig: kamino.globalConfig,

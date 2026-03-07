@@ -1,60 +1,119 @@
-# CVCT (Arcium) — Confidential Vault‑Backed Tokens
+# CVCT
 
-CVCT is a privacy‑preserving token layer for Solana that keeps balances and payroll flows confidential while remaining fully backed by on‑chain SPL assets. This branch uses **Arcium** as the confidential co‑processor: all sensitive state transitions happen inside MPC, while custody remains on Solana.
+CVCT is a confidential, vault-backed token system for Solana.
 
-## Hackathon Summary
+It combines:
+- public SPL asset custody on-chain
+- confidential balances and supply accounting via Arcium MPC
+- staged commit settlement so user-facing accounting only commits when custody commits
+- manual treasury deployment into Kamino without putting Kamino CPI in the user hot path
 
-Solana is transparent by default. CVCT makes payroll, treasury ops, and confidential DeFi flows possible by separating:
+## What CVCT does
 
-1. **Custody** — public vaults hold real SPL assets.
-1. **Accounting** — encrypted balances and totals are updated via MPC.
-1. **Authorization** — Anchor constraints enforce who can trigger updates.
+CVCT lets you issue a confidential claim on a backing SPL asset while keeping per-user balances private.
 
-CVCT is a **primitive** that other programs can build on, not a single closed system.
+The system is built around four ideas:
+- `Vault-backed`: real SPL assets sit in a Solana token account controlled by the protocol vault PDA
+- `Confidential accounting`: balances, total supply, and total locked assets are stored as encrypted state
+- `Staged commit`: deposit and redeem computations stage results first, then commit canonical state only during settlement
+- `Optimistic concurrency`: stale operations invalidate instead of overwriting newer pricing or balance state
 
-## Core Components
+## Current protocol shape
 
-**On‑chain accounts**
+### Deposit
+1. `request_deposit_intent` records a deposit intent and queues Arcium computation.
+2. `deposit_and_mint_callback` writes a staged result only.
+3. `settle_deposit_commit` transfers backing assets into the vault and commits the staged confidential state.
 
-1. `CvctMint`: metadata for a confidential mint, backed 1:1 by an SPL mint.
-1. `Vault`: PDA that holds the backing SPL tokens.
-1. `CvctAccount`: per‑user confidential balance account.
+### Redeem
+1. `request_redeem_intent` records a redeem intent and queues Arcium computation.
+2. `burn_and_withdraw_callback` writes a staged result only.
+3. `settle_redeem_commit` pays assets out of the vault and commits the staged confidential burn state.
 
-**Confidential circuits (Arcis)**
+### Transfer
+1. `transfer_cvct` queues confidential transfer computation.
+2. `transfer_cvct_callback` commits sender and recipient balance updates only if both account versions still match.
 
-1. `init_mint_state` — encrypts zeros for total supply and total locked.
-1. `init_account_state` — encrypts zero balance for a new account.
-1. `deposit_and_mint` — adds amount to encrypted balance/supply/locked.
-1. `burn_and_withdraw` — subtracts amount if balance permits and returns a boolean.
-1. `transfer_cvct` — transfers between encrypted balances.
+### Treasury / Kamino
+Kamino is intentionally outside the deposit and redeem hot paths.
 
-**Arcium flow**
+The protocol uses explicit treasury instructions:
+- `configure_kamino_adapter`
+- `kamino_deposit_idle`
+- `kamino_withdraw_to_vault`
+- `sync_total_assets_from_adapter`
 
-1. Instruction queues computation via `queue_computation`.
-1. MPC executes the Arcis circuit.
-1. Callback writes ciphertexts + nonces back on‑chain.
+That keeps user-critical settlement logic smaller, easier to reason about, and safer to retry.
 
-## Repo Layout
+## Core safety properties
 
-1. `programs/cvct`: Anchor program that queues computations and writes callbacks.
-1. `encrypted-ixs`: Arcis circuits for encrypted state transitions.
-1. `tests`: End‑to‑end tests that decrypt balances client‑side to verify correctness.
+- Deposit and redeem do not mutate canonical confidential state in callbacks.
+- Settlement is blocked until callback-visible staged state exists.
+- Stale staged operations invalidate if pricing state changed.
+- Stale staged operations invalidate if the user's balance changed.
+- Failed transfers do not mutate canonical balances or versions.
+- No-op syncs do not invalidate staged operations.
+- Operation-purpose PDAs can be explicitly cleaned up after terminal completion.
 
-## Why Arcium Improves Privacy
+## Main accounts
 
-Arcium provides:
+- `CvctMint`: encrypted total supply and backing mint metadata
+- `Vault`: encrypted total locked assets and backing token vault authority
+- `PricingState`: monotonic pricing version for stale-op invalidation
+- `CvctAccount`: per-user encrypted balance and balance version
+- `PendingOperation`: request lifecycle state for deposit and redeem
+- `PendingDepositResult`: staged deposit result
+- `PendingRedeemResult`: staged redeem result
+- `PendingTransferResult`: staged transfer result
+- `KaminoAdapterState`: manual treasury adapter configuration
 
-1. **Confidential computation** over encrypted values.
-1. **Verified outputs** via callback signature checks.
-1. **Minimal on‑chain leakage** (ciphertexts + nonces only).
+## Repository layout
 
-This removes the need for custom cryptography in the program while keeping custody on Solana.
+- `programs/cvct/`: Anchor program
+- `encrypted-ixs/`: Arcium encrypted instruction circuits
+- `tests/`: split integration suite
+- `docs/`: human-readable architecture and testing docs
+- `tests/fixtures/kamino/`: local Kamino artifacts used by integration tests
 
-## Running Locally
+## Local development
 
-1. Build: `arcium build`
-1. Test: `arcium test`
+### Build
+```bash
+arcium build
+```
 
-## Note
+### Test tiers
+```bash
+yarn test
+```
+Runs the smoke suite only.
 
-This branch is the forward path of CVCT. It replaces earlier INCO‑based encrypted arithmetic with Arcium MPC to improve correctness and privacy guarantees for withdrawals and transfers.
+```bash
+yarn test:cvct
+```
+Runs smoke + lifecycle + races.
+
+```bash
+CVCT_RUN_KAMINO_LOCAL=1 yarn test:kamino
+```
+Runs Kamino integration only.
+
+```bash
+CVCT_RUN_KAMINO_LOCAL=1 arcium test
+```
+Runs the full gate used for end-to-end local validation.
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md): protocol architecture and state model
+- [`docs/flows.md`](docs/flows.md): deposit, redeem, transfer, sync, and cleanup flows
+- [`docs/kamino-adapter.md`](docs/kamino-adapter.md): treasury adapter design and local Kamino notes
+- [`docs/testing.md`](docs/testing.md): suite layout, commands, and debugging guidance
+
+## Status
+
+The codebase is currently in a strong state:
+- staged-commit deposit and redeem are implemented
+- pricing-version and balance-version invalidation are in place
+- manual Kamino treasury integration is working
+- the split local integration suite is green
