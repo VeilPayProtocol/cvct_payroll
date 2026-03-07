@@ -1404,6 +1404,10 @@ pub mod cvct {
         pending_transfer_result.ok = ok;
         pending_transfer_result.callback_applied = true;
 
+        if !ok {
+            return Ok(());
+        }
+
         from_cvct_account.balance = from_balance.ciphertexts;
         from_cvct_account.balance_nonce = from_balance.nonce;
         from_cvct_account.balance_version = from_cvct_account

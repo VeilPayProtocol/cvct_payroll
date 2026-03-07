@@ -14,6 +14,7 @@ import {
   drainUserBackingTokens,
   expectRpcFailure,
   expireDepositIntentCall,
+  failedTransferCvct,
   fetchUserBackingBalance,
   fetchPendingDepositResult,
   fetchPendingRedeemResult,
@@ -357,6 +358,105 @@ describe("Cvct Races", () => {
     );
     expect(afterState.decryptedSupply).to.equal(beforeState.decryptedSupply);
     expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
+  });
+
+  it("[transfer] failed transfer preserves canonical state and versions", async () => {
+    const fixture = await createFixture(harness);
+    const beforeState = await getDecryptedState(fixture);
+
+    const result = await failedTransferCvct(fixture, 1);
+    expect(result.callbackApplied).to.equal(true);
+    expect(result.ok).to.equal(false);
+
+    const afterState = await getDecryptedState(fixture);
+    expect(afterState.decryptedBalance).to.equal(beforeState.decryptedBalance);
+    expect(afterState.decryptedRecipientBalance).to.equal(
+      beforeState.decryptedRecipientBalance,
+    );
+    expect(afterState.balanceVersion).to.equal(beforeState.balanceVersion);
+    expect(afterState.recipientBalanceVersion).to.equal(
+      beforeState.recipientBalanceVersion,
+    );
+  });
+
+  it("[deposit] failed transfer does not invalidate staged deposit", async () => {
+    const fixture = await createFixture(harness);
+    const initialQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const initialDepositReq = await requestDeposit(
+      fixture,
+      fixture.depositAmount,
+      initialQuote,
+    );
+    await finalizeAndSettleDeposit(fixture, initialDepositReq);
+
+    const stagedQuote = previewDepositShares(
+      fixture.depositAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, stagedQuote);
+    await waitForPendingDepositCallback(
+      fixture,
+      depositReq.operationPda,
+      depositReq.depositResultPda!,
+    );
+    expect(await fetchPendingStatus(fixture, depositReq.operationPda)).to.equal(
+      STATUS_COMPUTED_SUCCESS,
+    );
+
+    const beforeState = await getDecryptedState(fixture);
+    const failedAmount = fixture.depositAmount * 10;
+    const failedTransfer = await failedTransferCvct(fixture, failedAmount);
+    expect(failedTransfer.ok).to.equal(false);
+
+    const afterFailedTransfer = await getDecryptedState(fixture);
+    expect(afterFailedTransfer.balanceVersion).to.equal(beforeState.balanceVersion);
+    expect(await fetchPendingStatus(fixture, depositReq.operationPda)).to.equal(
+      STATUS_COMPUTED_SUCCESS,
+    );
+
+    await settleDepositCall(fixture, depositReq.operationPda, depositReq.depositResultPda);
+    expect(await fetchPendingStatus(fixture, depositReq.operationPda)).to.equal(
+      STATUS_SETTLED,
+    );
+  });
+
+  it("[redeem] failed transfer does not invalidate staged redeem", async () => {
+    const fixture = await createFixture(harness);
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    await waitForPendingRedeemCallback(
+      fixture,
+      redeemReq.operationPda,
+      redeemReq.redeemResultPda!,
+    );
+    expect(await fetchPendingStatus(fixture, redeemReq.operationPda)).to.equal(
+      STATUS_COMPUTED_SUCCESS,
+    );
+
+    const beforeState = await getDecryptedState(fixture);
+    const failedAmount = fixture.depositAmount * 10;
+    const failedTransfer = await failedTransferCvct(fixture, failedAmount);
+    expect(failedTransfer.ok).to.equal(false);
+
+    const afterFailedTransfer = await getDecryptedState(fixture);
+    expect(afterFailedTransfer.balanceVersion).to.equal(beforeState.balanceVersion);
+    expect(await fetchPendingStatus(fixture, redeemReq.operationPda)).to.equal(
+      STATUS_COMPUTED_SUCCESS,
+    );
+
+    await settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda);
+    expect(await fetchPendingStatus(fixture, redeemReq.operationPda)).to.equal(
+      STATUS_SETTLED,
+    );
   });
 
   it("[transfer] overlapping transfers commit at most one stale snapshot", async () => {

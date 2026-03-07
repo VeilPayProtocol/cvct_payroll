@@ -978,6 +978,27 @@ export async function awaitTransferComputation(
   return waitForPendingTransferCallback(fixture, req.transferResultPda!);
 }
 
+export async function failedTransferCvct(
+  fixture: Fixture,
+  amount: number,
+): Promise<any> {
+  const { harness } = fixture;
+  const req = await requestTransferCvct(fixture, amount);
+  await awaitComputationFinalization(
+    harness.provider,
+    req.computationOffset,
+    harness.program.programId,
+    "confirmed",
+  );
+  const transferResult = await waitForPendingTransferCallback(
+    fixture,
+    req.transferResultPda!,
+  );
+  expect(transferResult.callbackApplied).to.equal(true);
+  expect(transferResult.ok).to.equal(false);
+  return transferResult;
+}
+
 function isTerminalStatus(status: number): boolean {
   return status >= 3;
 }
