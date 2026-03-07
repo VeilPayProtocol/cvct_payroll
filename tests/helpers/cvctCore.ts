@@ -727,6 +727,7 @@ export async function finalizeAndSettleDeposit(
   await timed("finalizeAndSettleDeposit", async () => {
     const { harness } = fixture;
     await awaitOperationComputation(fixture, req);
+    await waitForPendingDepositCallback(fixture, req.operationPda, req.depositResultPda!);
 
     await rpcWithLogs(
       (harness.program.methods as any)
@@ -757,6 +758,7 @@ export async function finalizeAndSettleRedeem(
   await timed("finalizeAndSettleRedeem", async () => {
     const { harness } = fixture;
     await awaitOperationComputation(fixture, req);
+    await waitForPendingRedeemCallback(fixture, req.operationPda, req.redeemResultPda!);
 
     await rpcWithLogs(
       (harness.program.methods as any)
@@ -1203,6 +1205,15 @@ export async function settleDepositCall(
   operationPda: PublicKey,
   depositResultPda?: PublicKey,
 ): Promise<unknown> {
+  return buildSettleDepositTx(fixture, operationPda, depositResultPda)
+    .rpc(TEST_RPC_OPTIONS);
+}
+
+function buildSettleDepositTx(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  depositResultPda?: PublicKey,
+) {
   return (fixture.harness.program.methods as any)
     .settleDepositCommit()
     .accountsPartial({
@@ -1216,8 +1227,7 @@ export async function settleDepositCall(
       userTokenAccount: fixture.userTokenAccount,
       tokenProgram: TOKEN_PROGRAM_ID,
     })
-    .signers([fixture.harness.payer.payer])
-    .rpc(TEST_RPC_OPTIONS);
+    .signers([fixture.harness.payer.payer]);
 }
 
 export async function cancelDepositIntentCall(
@@ -1225,6 +1235,15 @@ export async function cancelDepositIntentCall(
   operationPda: PublicKey,
   depositResultPda?: PublicKey,
 ): Promise<unknown> {
+  return buildCancelDepositIntentTx(fixture, operationPda, depositResultPda)
+    .rpc(TEST_RPC_OPTIONS);
+}
+
+function buildCancelDepositIntentTx(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  depositResultPda?: PublicKey,
+) {
   return (fixture.harness.program.methods as any)
     .cancelDepositIntent()
     .accountsPartial({
@@ -1233,8 +1252,7 @@ export async function cancelDepositIntentCall(
       pendingOperation: operationPda,
       pendingDepositResult: depositResultPda,
     })
-    .signers([fixture.harness.payer.payer])
-    .rpc(TEST_RPC_OPTIONS);
+    .signers([fixture.harness.payer.payer]);
 }
 
 export async function expireDepositIntentCall(
@@ -1258,6 +1276,15 @@ export async function settleRedeemCall(
   operationPda: PublicKey,
   redeemResultPda?: PublicKey,
 ): Promise<unknown> {
+  return buildSettleRedeemTx(fixture, operationPda, redeemResultPda)
+    .rpc(TEST_RPC_OPTIONS);
+}
+
+function buildSettleRedeemTx(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  redeemResultPda?: PublicKey,
+) {
   return (fixture.harness.program.methods as any)
     .settleRedeemCommit()
     .accountsPartial({
@@ -1272,7 +1299,188 @@ export async function settleRedeemCall(
       userTokenAccount: fixture.userTokenAccount,
       tokenProgram: TOKEN_PROGRAM_ID,
     })
+}
+
+export async function cleanupTerminalDepositCall(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  depositResultPda: PublicKey,
+  executor?: anchor.web3.Keypair,
+): Promise<unknown> {
+  return buildCleanupTerminalDepositTx(fixture, operationPda, depositResultPda, executor)
     .rpc(TEST_RPC_OPTIONS);
+}
+
+function buildCleanupTerminalDepositTx(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  depositResultPda: PublicKey,
+  executor?: anchor.web3.Keypair,
+) {
+  const signer = executor ?? fixture.harness.payer.payer;
+  return (fixture.harness.program.methods as any)
+    .cleanupTerminalDeposit()
+    .accountsPartial({
+      executor: signer.publicKey,
+      cvctMint: fixture.cvctMintPda,
+      receiver: fixture.harness.payer.publicKey,
+      pendingOperation: operationPda,
+      pendingDepositResult: depositResultPda,
+    })
+    .signers([signer]);
+}
+
+export async function cleanupTerminalRedeemCall(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  redeemResultPda: PublicKey,
+  executor?: anchor.web3.Keypair,
+): Promise<unknown> {
+  return buildCleanupTerminalRedeemTx(fixture, operationPda, redeemResultPda, executor)
+    .rpc(TEST_RPC_OPTIONS);
+}
+
+function buildCleanupTerminalRedeemTx(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  redeemResultPda: PublicKey,
+  executor?: anchor.web3.Keypair,
+) {
+  const signer = executor ?? fixture.harness.payer.payer;
+  return (fixture.harness.program.methods as any)
+    .cleanupTerminalRedeem()
+    .accountsPartial({
+      executor: signer.publicKey,
+      cvctMint: fixture.cvctMintPda,
+      receiver: fixture.harness.payer.publicKey,
+      pendingOperation: operationPda,
+      pendingRedeemResult: redeemResultPda,
+    })
+    .signers([signer]);
+}
+
+export async function cleanupTransferResultCall(
+  fixture: Fixture,
+  transferResultPda: PublicKey,
+  executor?: anchor.web3.Keypair,
+): Promise<unknown> {
+  const signer = executor ?? fixture.harness.payer.payer;
+  return (fixture.harness.program.methods as any)
+    .cleanupTransferResult()
+    .accountsPartial({
+      executor: signer.publicKey,
+      receiver: fixture.harness.payer.publicKey,
+      fromCvctAccount: fixture.cvctAccountPda,
+      pendingTransferResult: transferResultPda,
+    })
+    .signers([signer])
+    .rpc(TEST_RPC_OPTIONS);
+}
+
+export async function createCleanupExecutor(
+  fixture: Fixture,
+  lamports = anchor.web3.LAMPORTS_PER_SOL / 10,
+): Promise<anchor.web3.Keypair> {
+  const executor = anchor.web3.Keypair.generate();
+  await transferLamports(
+    fixture.harness.connection,
+    fixture.harness.payer.payer,
+    executor.publicKey,
+    lamports,
+  );
+  return executor;
+}
+
+async function expectMethodSimFailure(
+  label: string,
+  simulateCall: () => Promise<unknown>,
+  expectedMessageFragment: string,
+): Promise<void> {
+  try {
+    await simulateCall();
+    throw new Error(`Expected simulation failure for ${label} but call succeeded`);
+  } catch (err: any) {
+    const msg = [
+      label,
+      err?.message ?? String(err),
+      err?.logs ? err.logs.join(" ") : "",
+      err?.simulationResponse?.logs ? err.simulationResponse.logs.join(" ") : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    expect(msg).to.contain(expectedMessageFragment);
+  }
+}
+
+export async function expectSettleDepositRejectedSim(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  depositResultPda: PublicKey | undefined,
+  expectedMessageFragment: string,
+): Promise<void> {
+  await expectMethodSimFailure(
+    "settleDepositCommit",
+    () =>
+      buildSettleDepositTx(fixture, operationPda, depositResultPda).simulate(
+        TEST_RPC_OPTIONS,
+      ),
+    expectedMessageFragment,
+  );
+}
+
+export async function expectCancelDepositRejectedSim(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  depositResultPda: PublicKey | undefined,
+  expectedMessageFragment: string,
+): Promise<void> {
+  await expectMethodSimFailure(
+    "cancelDepositIntent",
+    () =>
+      buildCancelDepositIntentTx(fixture, operationPda, depositResultPda).simulate(
+        TEST_RPC_OPTIONS,
+      ),
+    expectedMessageFragment,
+  );
+}
+
+export async function expectSettleRedeemRejectedSim(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  redeemResultPda: PublicKey | undefined,
+  expectedMessageFragment: string,
+): Promise<void> {
+  await expectMethodSimFailure(
+    "settleRedeemCommit",
+    () =>
+      buildSettleRedeemTx(fixture, operationPda, redeemResultPda).simulate(
+        TEST_RPC_OPTIONS,
+      ),
+    expectedMessageFragment,
+  );
+}
+
+export async function expectRedeemCleanupRejectedSim(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  redeemResultPda: PublicKey,
+  expectedMessageFragment: string,
+): Promise<void> {
+  await expectMethodSimFailure(
+    "cleanupTerminalRedeem",
+    () =>
+      buildCleanupTerminalRedeemTx(fixture, operationPda, redeemResultPda).simulate(
+        TEST_RPC_OPTIONS,
+      ),
+    expectedMessageFragment,
+  );
+}
+
+export async function accountExists(
+  fixture: Fixture,
+  pubkey: PublicKey,
+): Promise<boolean> {
+  return (await fixture.harness.connection.getAccountInfo(pubkey, "confirmed")) !== null;
 }
 
 async function waitForUpdatedBalances(

@@ -3,10 +3,10 @@
   "license": "ISC",
   "scripts": {
     "test": "yarn run test:fast",
-    "test:fast": "ts-mocha -p ./tsconfig.json -t 1000000 \"tests/cvct.fast.ts\"",
-    "test:cvct": "ts-mocha -p ./tsconfig.json -t 1000000 \"tests/cvct.fast.ts\" \"tests/cvct.races.ts\"",
+    "test:fast": "ts-mocha -p ./tsconfig.json -t 1000000 \"tests/cvct.smoke.ts\"",
+    "test:cvct": "ts-mocha -p ./tsconfig.json -t 1000000 \"tests/cvct.smoke.ts\" \"tests/cvct.lifecycle.ts\" \"tests/cvct.races.ts\"",
     "test:kamino": "CVCT_RUN_KAMINO_LOCAL=1 ts-mocha -p ./tsconfig.json -t 1000000 \"tests/kamino_adapter.ts\"",
-    "test:all": "CVCT_RUN_KAMINO_LOCAL=1 ts-mocha -p ./tsconfig.json -t 1000000 \"tests/cvct.fast.ts\" \"tests/cvct.races.ts\" \"tests/kamino_adapter.ts\"",
+    "test:all": "CVCT_RUN_KAMINO_LOCAL=1 ts-mocha -p ./tsconfig.json -t 1000000 \"tests/cvct.smoke.ts\" \"tests/kamino_adapter.ts\" \"tests/cvct.lifecycle.ts\" \"tests/cvct.races.ts\"",
     "lint:fix": "prettier */*.js \"*/**/*{.js,.ts}\" -w",
     "lint": "prettier */*.js \"*/**/*{.js,.ts}\" --check"
   },

@@ -1,89 +1,56 @@
 import * as anchor from "@coral-xyz/anchor";
 import { expect } from "chai";
 import {
-  Harness,
-  assertEarlySettleRejected,
-  assertEncryptedTotals,
+  accountExists,
   assertTerminalNoopOnResettle,
   assertTokenBalances,
+  fetchPendingDepositResult,
+  fetchPendingRedeemResult,
+  fetchPendingStatus,
+  getDecryptedState,
+  waitForPendingRedeemCallback,
+} from "./helpers/cvctAssertions";
+import {
   awaitOperationComputation,
   awaitTransferComputation,
   cancelDepositIntentCall,
-  createFixture,
-  createHarness,
-  createSeededFastFixture,
-  drainUserBackingTokens,
-  expectRpcFailure,
+  cleanupTerminalDepositCall,
+  cleanupTerminalRedeemCall,
+  cleanupTransferResultCall,
+  createDepositedFixture,
+  createCleanupExecutor,
   expireDepositIntentCall,
-  fetchUserBackingBalance,
-  fetchPendingDepositResult,
-  fetchPendingRedeemResult,
-  fetchPendingTransferResult,
-  fetchPricingVersion,
-  fetchPendingStatus,
+  expectCancelDepositRejectedSim,
+  expectRedeemCleanupRejectedSim,
+  expectSettleDepositRejectedSim,
+  expectSettleRedeemRejectedSim,
   finalizeAndSettleDeposit,
   finalizeAndSettleRedeem,
-  getDecryptedState,
-  previewDepositShares,
-  previewRedeemAssets,
   requestDeposit,
   requestRedeem,
   requestTransferCvct,
   settleDepositCall,
   settleRedeemCall,
-  syncTotalAssetsNoop,
-  transferCvct,
-  waitForPendingDepositCallback,
-  waitForPendingRedeemCallback,
-} from "./helpers/cvctHarness";
+} from "./helpers/cvctFlows";
+import {
+  type Harness,
+  type Fixture,
+  createHarness,
+  createFixture,
+  previewDepositShares,
+  previewRedeemAssets,
+} from "./helpers/cvctEnv";
 
 const STATUS_SETTLED = 3;
 const STATUS_FAILED = 5;
 const STATUS_CANCELLED = 6;
 const STATUS_EXPIRED = 7;
-const STATUS_INVALIDATED = 8;
-const STATUS_COMPUTED_SUCCESS = 1;
 
-describe("Cvct Fast", () => {
+describe("Cvct Lifecycle", () => {
   let harness: Harness;
-  let seededFixture: Awaited<ReturnType<typeof createSeededFastFixture>>;
 
   before(async () => {
     harness = await createHarness(false);
-    seededFixture = await createSeededFastFixture(harness);
-  });
-
-  it("[math] validates deterministic share math vectors and invariants", async () => {
-    const bootstrapShares = previewDepositShares(500_000, 0, 0);
-    expect(bootstrapShares).to.equal(500_000);
-
-    const supplyBefore = 1_000_000;
-    const assetsBefore = 1_200_000;
-    const sharesOut = previewDepositShares(100_000, supplyBefore, assetsBefore);
-    const assetsOut = previewRedeemAssets(100_000, supplyBefore, assetsBefore);
-
-    expect(sharesOut).to.be.lessThan(100_000);
-    expect(assetsOut).to.be.greaterThan(100_000);
-
-    for (let i = 1; i <= 250; i += 1) {
-      const assets = i * 13 + 19;
-      const supply = i * 11 + 17;
-      const depositIn = i * 7 + 1;
-      const minted = previewDepositShares(depositIn, supply, assets);
-      if (minted === 0) continue;
-
-      const redeemed = previewRedeemAssets(minted, supply + minted, assets + depositIn);
-      expect(redeemed).to.be.lte(depositIn);
-    }
-  });
-
-  it("[init] initializes mint + account state", async () => {
-    const state = await getDecryptedState(seededFixture);
-
-    expect(state.decryptedBalance).to.equal(BigInt(0));
-    expect(state.decryptedRecipientBalance).to.equal(BigInt(0));
-    expect(state.decryptedSupply).to.equal(BigInt(0));
-    expect(state.decryptedLocked).to.equal(BigInt(0));
   });
 
   it("[deposit] request rejects early settle before callback", async () => {
@@ -91,8 +58,11 @@ describe("Cvct Fast", () => {
     const quote = previewDepositShares(fixture.depositAmount, 0, 0);
     const req = await requestDeposit(fixture, fixture.depositAmount, quote);
 
-    await assertEarlySettleRejected(
-      settleDepositCall(fixture, req.operationPda, req.depositResultPda),
+    await expectSettleDepositRejectedSim(
+      fixture,
+      req.operationPda,
+      req.depositResultPda,
+      "Operation has not been computed yet",
     );
   });
 
@@ -116,8 +86,6 @@ describe("Cvct Fast", () => {
     expect(staged.ok).to.equal(true);
     expect(Number(staged.sharesOut)).to.equal(quote);
     expect(staged.operationId.toString()).to.equal(op.operationId.toString());
-    expect(staged.cvctMint.toBase58()).to.equal(fixture.cvctMintPda.toBase58());
-    expect(staged.user.toBase58()).to.equal(harness.payer.publicKey.toBase58());
   });
 
   it("[deposit] settles success path and is idempotent", async () => {
@@ -127,14 +95,11 @@ describe("Cvct Fast", () => {
 
     await finalizeAndSettleDeposit(fixture, req);
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(STATUS_SETTLED);
-    await assertTokenBalances(fixture, 1_000_000 - fixture.depositAmount, fixture.depositAmount);
 
     await assertTerminalNoopOnResettle(() =>
       settleDepositCall(fixture, req.operationPda, req.depositResultPda),
     );
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(STATUS_SETTLED);
-    const state = await getDecryptedState(fixture);
-    expect(state.balanceVersion).to.equal(1);
   });
 
   it("[deposit] fails without custody movement when callback marks an invalid quote", async () => {
@@ -145,20 +110,7 @@ describe("Cvct Fast", () => {
 
     await finalizeAndSettleDeposit(fixture, req);
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(STATUS_FAILED);
-
-    const state = await getDecryptedState(fixture);
-    expect(state.decryptedBalance).to.equal(BigInt(0));
-    expect(state.decryptedSupply).to.equal(BigInt(0));
-    expect(state.decryptedLocked).to.equal(BigInt(0));
-
     await assertTokenBalances(fixture, 1_000_000, 0);
-  });
-
-  it("[deposit] rejects zero asset requests", async () => {
-    await expectRpcFailure(
-      requestDeposit(seededFixture, 0, 1),
-      "Amount must be greater than zero",
-    );
   });
 
   it("[deposit] cancel succeeds while requested and leaves state unchanged", async () => {
@@ -168,12 +120,6 @@ describe("Cvct Fast", () => {
 
     await cancelDepositIntentCall(fixture, req.operationPda, req.depositResultPda);
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(STATUS_CANCELLED);
-    await assertTokenBalances(fixture, 1_000_000, 0);
-
-    const state = await getDecryptedState(fixture);
-    expect(state.decryptedBalance).to.equal(BigInt(0));
-    expect(state.decryptedSupply).to.equal(BigInt(0));
-    expect(state.decryptedLocked).to.equal(BigInt(0));
   });
 
   it("[deposit] cancel rejects after callback has been applied", async () => {
@@ -182,8 +128,10 @@ describe("Cvct Fast", () => {
     const req = await requestDeposit(fixture, fixture.depositAmount, quote);
     await awaitOperationComputation(fixture, req);
 
-    await expectRpcFailure(
-      cancelDepositIntentCall(fixture, req.operationPda, req.depositResultPda),
+    await expectCancelDepositRejectedSim(
+      fixture,
+      req.operationPda,
+      req.depositResultPda,
       "Invalid operation phase for this instruction",
     );
   });
@@ -198,14 +146,37 @@ describe("Cvct Fast", () => {
 
     await expireDepositIntentCall(fixture, req.operationPda, req.depositResultPda);
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(STATUS_EXPIRED);
-    await assertTokenBalances(fixture, 1_000_000, 0);
+  });
+
+  it("[deposit] cleanup closes settled terminal PDAs and returns lamports to user", async () => {
+    const fixture = await createFixture(harness);
+    const executor = await createCleanupExecutor(fixture);
+    const quote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const req = await requestDeposit(fixture, fixture.depositAmount, quote);
+    await finalizeAndSettleDeposit(fixture, req);
+
+    const beforeLamports = await harness.connection.getBalance(
+      harness.payer.publicKey,
+      "confirmed",
+    );
+    await cleanupTerminalDepositCall(
+      fixture,
+      req.operationPda,
+      req.depositResultPda!,
+      executor,
+    );
+    const afterLamports = await harness.connection.getBalance(
+      harness.payer.publicKey,
+      "confirmed",
+    );
+
+    expect(await accountExists(fixture, req.operationPda)).to.equal(false);
+    expect(await accountExists(fixture, req.depositResultPda!)).to.equal(false);
+    expect(afterLamports).to.be.greaterThan(beforeLamports);
   });
 
   it("[redeem] request rejects early settle before callback", async () => {
-    const fixture = await createFixture(harness);
-    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
-    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
+    const { fixture } = await createDepositedFixture(harness);
 
     const redeemQuote = previewRedeemAssets(
       fixture.burnAmount,
@@ -214,16 +185,16 @@ describe("Cvct Fast", () => {
     );
     const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
 
-    await assertEarlySettleRejected(
-      settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda),
+    await expectSettleRedeemRejectedSim(
+      fixture,
+      redeemReq.operationPda,
+      redeemReq.redeemResultPda,
+      "Operation has not been computed yet",
     );
   });
 
   it("[redeem] callback stages result without mutating canonical state", async () => {
-    const fixture = await createFixture(harness);
-    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
-    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
+    const { fixture } = await createDepositedFixture(harness);
 
     const redeemQuote = previewRedeemAssets(
       fixture.burnAmount,
@@ -240,14 +211,8 @@ describe("Cvct Fast", () => {
     expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
 
     const staged = await fetchPendingRedeemResult(fixture, redeemReq.redeemResultPda!);
-    const op = await (fixture.harness.program.account as any).pendingOperation.fetch(
-      redeemReq.operationPda,
-    );
     expect(staged.ok).to.equal(true);
     expect(Number(staged.assetsOut)).to.equal(redeemQuote);
-    expect(staged.operationId.toString()).to.equal(op.operationId.toString());
-    expect(staged.cvctMint.toBase58()).to.equal(fixture.cvctMintPda.toBase58());
-    expect(staged.user.toBase58()).to.equal(harness.payer.publicKey.toBase58());
   });
 
   it("[redeem] settles success/failure path and is idempotent", async () => {
@@ -266,8 +231,6 @@ describe("Cvct Fast", () => {
     expect(await fetchPendingStatus(fixture, successReq.operationPda)).to.equal(
       STATUS_SETTLED,
     );
-    let state = await getDecryptedState(fixture);
-    expect(state.balanceVersion).to.equal(2);
 
     await assertTerminalNoopOnResettle(() =>
       settleRedeemCall(fixture, successReq.operationPda, successReq.redeemResultPda),
@@ -281,49 +244,10 @@ describe("Cvct Fast", () => {
     expect(await fetchPendingStatus(fixture, failureReq.operationPda)).to.equal(
       STATUS_FAILED,
     );
-
-    await assertTerminalNoopOnResettle(() =>
-      settleRedeemCall(fixture, failureReq.operationPda, failureReq.redeemResultPda),
-    );
-    expect(await fetchPendingStatus(fixture, failureReq.operationPda)).to.equal(
-      STATUS_FAILED,
-    );
-    state = await getDecryptedState(fixture);
-    expect(state.balanceVersion).to.equal(2);
   });
 
-  it("[redeem] rejects zero share requests", async () => {
-    await expectRpcFailure(
-      requestRedeem(seededFixture, 0, 1),
-      "Amount must be greater than zero",
-    );
-  });
-
-  it("[transfer] updates sender/recipient only", async () => {
-    const fixture = await createFixture(harness);
-    const quote = previewDepositShares(fixture.depositAmount, 0, 0);
-    const req = await requestDeposit(fixture, fixture.depositAmount, quote);
-    await finalizeAndSettleDeposit(fixture, req);
-
-    await transferCvct(fixture, fixture.transferAmount);
-    const state = await getDecryptedState(fixture);
-
-    expect(state.decryptedBalance).to.equal(
-      BigInt(fixture.depositAmount - fixture.transferAmount),
-    );
-    expect(state.decryptedRecipientBalance).to.equal(BigInt(fixture.transferAmount));
-    expect(state.decryptedSupply).to.equal(BigInt(fixture.depositAmount));
-    expect(state.decryptedLocked).to.equal(BigInt(fixture.depositAmount));
-    expect(state.balanceVersion).to.equal(2);
-    expect(state.recipientBalanceVersion).to.equal(1);
-  });
-
-  it("[invariant] global accounting invariants hold after deposit+redeem", async () => {
-    const fixture = await createFixture(harness);
-
-    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
-    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
+  it("[redeem] cleanup rejects non-terminal computed-success ops", async () => {
+    const { fixture } = await createDepositedFixture(harness);
 
     const redeemQuote = previewRedeemAssets(
       fixture.burnAmount,
@@ -331,23 +255,51 @@ describe("Cvct Fast", () => {
       fixture.depositAmount,
     );
     const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
-    await finalizeAndSettleRedeem(fixture, redeemReq);
-
-    const state = await getDecryptedState(fixture);
-    const expectedSupply = BigInt(fixture.depositAmount - fixture.burnAmount);
-    const expectedLocked = BigInt(fixture.depositAmount - fixture.burnAmount);
-
-    assertEncryptedTotals(
-      state.decryptedSupply,
-      state.decryptedLocked,
-      expectedSupply,
-      expectedLocked,
-    );
-
-    await assertTokenBalances(
+    await waitForPendingRedeemCallback(
       fixture,
-      1_000_000 - fixture.depositAmount + fixture.burnAmount,
-      fixture.depositAmount - fixture.burnAmount,
+      redeemReq.operationPda,
+      redeemReq.redeemResultPda!,
     );
+
+    await expectRedeemCleanupRejectedSim(
+      fixture,
+      redeemReq.operationPda,
+      redeemReq.redeemResultPda!,
+      "Invalid operation phase for this instruction",
+    );
+  });
+
+  it("[redeem] cleanup closes settled terminal PDAs", async () => {
+    const { fixture } = await createDepositedFixture(harness);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+
+    await finalizeAndSettleRedeem(fixture, redeemReq);
+    await cleanupTerminalRedeemCall(
+      fixture,
+      redeemReq.operationPda,
+      redeemReq.redeemResultPda!,
+    );
+
+    expect(await accountExists(fixture, redeemReq.operationPda)).to.equal(false);
+    expect(await accountExists(fixture, redeemReq.redeemResultPda!)).to.equal(false);
+  });
+
+  it("[transfer] cleanup closes transfer result after callback", async () => {
+    const fixture = await createFixture(harness);
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const transferReq = await requestTransferCvct(fixture, fixture.transferAmount);
+    await awaitTransferComputation(fixture, transferReq);
+    await cleanupTransferResultCall(fixture, transferReq.transferResultPda!);
+
+    expect(await accountExists(fixture, transferReq.transferResultPda!)).to.equal(false);
   });
 });

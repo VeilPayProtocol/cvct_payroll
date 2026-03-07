@@ -524,7 +524,7 @@ pub mod cvct {
                 || pending_op.status == STATUS_COMPUTED_FAILURE,
             ErrorCode::InvalidOperationPhase
         );
-        let pending_result = &ctx.accounts.pending_deposit_result;
+        let pending_result = &mut ctx.accounts.pending_deposit_result;
         require!(
             pending_result.operation_id == pending_op.operation_id,
             ErrorCode::InvalidPendingOperation
@@ -560,6 +560,10 @@ pub mod cvct {
                 != pending_result.base_user_balance_version
         {
             pending_op.status = STATUS_INVALIDATED;
+            pending_op.ok = false;
+            pending_op.amount_out = 0;
+            pending_result.ok = false;
+            pending_result.shares_out = 0;
             emit!(OperationSettledEvent {
                 operation_id: pending_op.operation_id,
                 kind: pending_op.kind,
@@ -642,6 +646,10 @@ pub mod cvct {
             final_status: pending_op.status,
             amount_out: 0,
         });
+        Ok(())
+    }
+
+    pub fn cleanup_terminal_deposit(_ctx: Context<CleanupTerminalDeposit>) -> Result<()> {
         Ok(())
     }
 
@@ -937,7 +945,7 @@ pub mod cvct {
                 || pending_op.status == STATUS_COMPUTED_FAILURE,
             ErrorCode::InvalidOperationPhase
         );
-        let pending_result = &ctx.accounts.pending_redeem_result;
+        let pending_result = &mut ctx.accounts.pending_redeem_result;
         require!(
             pending_result.operation_id == pending_op.operation_id,
             ErrorCode::InvalidPendingOperation
@@ -973,6 +981,10 @@ pub mod cvct {
                 != pending_result.base_user_balance_version
         {
             pending_op.status = STATUS_INVALIDATED;
+            pending_op.ok = false;
+            pending_op.amount_out = 0;
+            pending_result.ok = false;
+            pending_result.assets_out = 0;
             emit!(OperationSettledEvent {
                 operation_id: pending_op.operation_id,
                 kind: pending_op.kind,
@@ -1042,6 +1054,10 @@ pub mod cvct {
             final_status: pending_op.status,
             amount_out: pending_op.amount_out,
         });
+        Ok(())
+    }
+
+    pub fn cleanup_terminal_redeem(_ctx: Context<CleanupTerminalRedeem>) -> Result<()> {
         Ok(())
     }
 
@@ -1285,6 +1301,7 @@ pub mod cvct {
         require!(amount > 0, ErrorCode::ZeroAmount);
         let pending_transfer_result = &mut ctx.accounts.pending_transfer_result;
         pending_transfer_result.set_inner(PendingTransferResult {
+            user: ctx.accounts.user.key(),
             from_account: ctx.accounts.from_cvct_account.key(),
             to_account: ctx.accounts.to_cvct_account.key(),
             from_balance: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
@@ -1424,6 +1441,10 @@ pub mod cvct {
 
         Ok(())
     }
+
+    pub fn cleanup_transfer_result(_ctx: Context<CleanupTransferResult>) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[account]
@@ -1499,6 +1520,7 @@ pub enum OperationStatus {
     ComputedSuccess = 1,
     ComputedFailure = 2,
     Settled = 3,
+    /// Legacy v1 status retained for backward-compatible decoding only.
     Refunded = 4,
     Failed = 5,
     Cancelled = 6,
@@ -1584,6 +1606,7 @@ impl PendingRedeemResult {
 
 #[account]
 pub struct PendingTransferResult {
+    pub user: Pubkey,
     pub from_account: Pubkey,
     pub to_account: Pubkey,
     pub from_balance: [[u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
@@ -1598,7 +1621,7 @@ pub struct PendingTransferResult {
 
 impl PendingTransferResult {
     pub const LEN: usize =
-        (32 * 2) + (32 * ENCRYPTED_U128_CIPHERTEXTS * 2) + 16 + 16 + 1 + 8 + 8 + 1;
+        (32 * 3) + (32 * ENCRYPTED_U128_CIPHERTEXTS * 2) + 16 + 16 + 1 + 8 + 8 + 1;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -2263,6 +2286,7 @@ pub struct SettleDepositCommit<'info> {
     )]
     pub pending_operation: Box<Account<'info, PendingOperation>>,
     #[account(
+        mut,
         constraint = pending_deposit_result.callback_applied @ ErrorCode::OperationNotComputed,
         seeds = [
             b"pending_deposit_result",
@@ -2342,6 +2366,38 @@ pub struct ExpireDepositIntent<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CleanupTerminalDeposit<'info> {
+    #[account(mut)]
+    pub executor: Signer<'info>,
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        constraint = receiver.key() == pending_operation.user @ ErrorCode::Unauthorized,
+    )]
+    pub receiver: SystemAccount<'info>,
+    #[account(
+        mut,
+        close = receiver,
+        constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.kind == OperationKind::Deposit as u8 @ ErrorCode::InvalidOperationKind,
+        constraint = is_terminal_status(pending_operation.status) @ ErrorCode::InvalidOperationPhase,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(
+        mut,
+        close = receiver,
+        seeds = [
+            b"pending_deposit_result",
+            cvct_mint.key().as_ref(),
+            pending_operation.user.as_ref(),
+            pending_operation.operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_deposit_result: Box<Account<'info, PendingDepositResult>>,
+}
+
+#[derive(Accounts)]
 pub struct SettleRedeemCommit<'info> {
     #[account(mut)]
     pub executor: Signer<'info>,
@@ -2370,6 +2426,7 @@ pub struct SettleRedeemCommit<'info> {
     )]
     pub pending_operation: Box<Account<'info, PendingOperation>>,
     #[account(
+        mut,
         constraint = pending_redeem_result.callback_applied @ ErrorCode::OperationNotComputed,
         seeds = [
             b"pending_redeem_result",
@@ -2397,6 +2454,38 @@ pub struct SettleRedeemCommit<'info> {
     #[account(mut, constraint = user_token_account.mint == cvct_mint.backing_mint)]
     pub user_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct CleanupTerminalRedeem<'info> {
+    #[account(mut)]
+    pub executor: Signer<'info>,
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        constraint = receiver.key() == pending_operation.user @ ErrorCode::Unauthorized,
+    )]
+    pub receiver: SystemAccount<'info>,
+    #[account(
+        mut,
+        close = receiver,
+        constraint = pending_operation.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_operation.kind == OperationKind::Redeem as u8 @ ErrorCode::InvalidOperationKind,
+        constraint = is_terminal_status(pending_operation.status) @ ErrorCode::InvalidOperationPhase,
+    )]
+    pub pending_operation: Box<Account<'info, PendingOperation>>,
+    #[account(
+        mut,
+        close = receiver,
+        seeds = [
+            b"pending_redeem_result",
+            cvct_mint.key().as_ref(),
+            pending_operation.user.as_ref(),
+            pending_operation.operation_id.to_le_bytes().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_redeem_result: Box<Account<'info, PendingRedeemResult>>,
 }
 
 #[derive(Accounts)]
@@ -2519,8 +2608,8 @@ pub struct KaminoDepositIdle<'info> {
     )]
     pub klend_program: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
-    /// CHECK: token or token-2022 for shares mint based on Kamino setup.
-    pub shares_token_program: UncheckedAccount<'info>,
+    /// Classic SPL Token program for Kamino shares accounts in the current adapter.
+    pub shares_token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -2605,8 +2694,8 @@ pub struct KaminoWithdrawToVault<'info> {
     )]
     pub klend_program: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
-    /// CHECK: token or token-2022 for shares mint based on Kamino setup.
-    pub shares_token_program: UncheckedAccount<'info>,
+    /// Classic SPL Token program for Kamino shares accounts in the current adapter.
+    pub shares_token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -2752,6 +2841,26 @@ pub struct TransferCvctCallback<'info> {
             computation_account.key().as_ref(),
         ],
         bump,
+    )]
+    pub pending_transfer_result: Box<Account<'info, PendingTransferResult>>,
+}
+
+#[derive(Accounts)]
+pub struct CleanupTransferResult<'info> {
+    #[account(mut)]
+    pub executor: Signer<'info>,
+    #[account(
+        mut,
+        constraint = receiver.key() == pending_transfer_result.user @ ErrorCode::Unauthorized,
+        constraint = receiver.key() == from_cvct_account.owner @ ErrorCode::Unauthorized,
+    )]
+    pub receiver: SystemAccount<'info>,
+    pub from_cvct_account: Box<Account<'info, CvctAccount>>,
+    #[account(
+        mut,
+        close = receiver,
+        constraint = pending_transfer_result.from_account == from_cvct_account.key() @ ErrorCode::InvalidPendingOperation,
+        constraint = pending_transfer_result.callback_applied @ ErrorCode::OperationNotComputed,
     )]
     pub pending_transfer_result: Box<Account<'info, PendingTransferResult>>,
 }

@@ -1,31 +1,31 @@
 import * as anchor from "@coral-xyz/anchor";
 import { expect } from "chai";
 import {
-  Harness,
+  accountExists,
   assertEarlySettleRejected,
   assertEncryptedTotals,
   assertTerminalNoopOnResettle,
   assertTokenBalances,
-  awaitOperationComputation,
-  awaitTransferComputation,
-  cancelDepositIntentCall,
-  createFixture,
-  createHarness,
-  drainUserBackingTokens,
   expectRpcFailure,
-  expireDepositIntentCall,
-  failedTransferCvct,
   fetchUserBackingBalance,
   fetchPendingDepositResult,
   fetchPendingRedeemResult,
-  fetchPendingTransferResult,
   fetchPricingVersion,
   fetchPendingStatus,
+  getDecryptedState,
+  waitForPendingDepositCallback,
+  waitForPendingRedeemCallback,
+} from "./helpers/cvctAssertions";
+import {
+  awaitOperationComputation,
+  awaitTransferComputation,
+  cleanupTerminalDepositCall,
+  cleanupTerminalRedeemCall,
+  cleanupTransferResultCall,
+  drainUserBackingTokens,
+  failedTransferCvct,
   finalizeAndSettleDeposit,
   finalizeAndSettleRedeem,
-  getDecryptedState,
-  previewDepositShares,
-  previewRedeemAssets,
   requestDeposit,
   requestRedeem,
   requestTransferCvct,
@@ -34,9 +34,14 @@ import {
   syncTotalAssetsChanged,
   syncTotalAssetsNoop,
   transferCvct,
-  waitForPendingDepositCallback,
-  waitForPendingRedeemCallback,
-} from "./helpers/cvctHarness";
+} from "./helpers/cvctFlows";
+import {
+  type Harness,
+  createHarness,
+  createFixture,
+  previewDepositShares,
+  previewRedeemAssets,
+} from "./helpers/cvctEnv";
 
 const STATUS_SETTLED = 3;
 const STATUS_FAILED = 5;
@@ -162,6 +167,14 @@ describe("Cvct Races", () => {
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(
       STATUS_INVALIDATED,
     );
+    const op = await (fixture.harness.program.account as any).pendingOperation.fetch(
+      req.operationPda,
+    );
+    const result = await fetchPendingDepositResult(fixture, req.depositResultPda!);
+    expect(op.ok).to.equal(false);
+    expect(Number(op.amountOut)).to.equal(0);
+    expect(result.ok).to.equal(false);
+    expect(Number(result.sharesOut)).to.equal(0);
     expect(await fetchPricingVersion(fixture)).to.equal(versionAfterSync);
     await assertTokenBalances(fixture, 1_000_000, 0);
   });
@@ -279,6 +292,14 @@ describe("Cvct Races", () => {
     expect(await fetchPendingStatus(fixture, req.operationPda)).to.equal(
       STATUS_INVALIDATED,
     );
+    const op = await (fixture.harness.program.account as any).pendingOperation.fetch(
+      req.operationPda,
+    );
+    const result = await fetchPendingRedeemResult(fixture, req.redeemResultPda!);
+    expect(op.ok).to.equal(false);
+    expect(Number(op.amountOut)).to.equal(0);
+    expect(result.ok).to.equal(false);
+    expect(Number(result.assetsOut)).to.equal(0);
     expect(await fetchPricingVersion(fixture)).to.equal(versionAfterSync);
     await assertTokenBalances(
       fixture,
@@ -325,6 +346,42 @@ describe("Cvct Races", () => {
     expect(afterState.balanceVersion).to.equal(beforeState.balanceVersion + 1);
   });
 
+  it("[deposit] cleanup closes invalidated terminal PDAs", async () => {
+    const fixture = await createFixture(harness);
+    const initialQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const initialDepositReq = await requestDeposit(
+      fixture,
+      fixture.depositAmount,
+      initialQuote,
+    );
+    await finalizeAndSettleDeposit(fixture, initialDepositReq);
+
+    const stagedQuote = previewDepositShares(
+      fixture.depositAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, stagedQuote);
+    await waitForPendingDepositCallback(
+      fixture,
+      depositReq.operationPda,
+      depositReq.depositResultPda!,
+    );
+    await transferCvct(fixture, 1);
+    await settleDepositCall(fixture, depositReq.operationPda, depositReq.depositResultPda);
+    expect(await fetchPendingStatus(fixture, depositReq.operationPda)).to.equal(
+      STATUS_INVALIDATED,
+    );
+
+    await cleanupTerminalDepositCall(
+      fixture,
+      depositReq.operationPda,
+      depositReq.depositResultPda!,
+    );
+    expect(await accountExists(fixture, depositReq.operationPda)).to.equal(false);
+    expect(await accountExists(fixture, depositReq.depositResultPda!)).to.equal(false);
+  });
+
   it("[redeem] invalidates when transfer updates user balance before callback", async () => {
     const fixture = await createFixture(harness);
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
@@ -360,6 +417,38 @@ describe("Cvct Races", () => {
     expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
   });
 
+  it("[redeem] cleanup closes invalidated terminal PDAs", async () => {
+    const fixture = await createFixture(harness);
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(fixture, depositReq);
+
+    const redeemQuote = previewRedeemAssets(
+      fixture.burnAmount,
+      fixture.depositAmount,
+      fixture.depositAmount,
+    );
+    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    await waitForPendingRedeemCallback(
+      fixture,
+      redeemReq.operationPda,
+      redeemReq.redeemResultPda!,
+    );
+    await transferCvct(fixture, fixture.transferAmount);
+    await settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda);
+    expect(await fetchPendingStatus(fixture, redeemReq.operationPda)).to.equal(
+      STATUS_INVALIDATED,
+    );
+
+    await cleanupTerminalRedeemCall(
+      fixture,
+      redeemReq.operationPda,
+      redeemReq.redeemResultPda!,
+    );
+    expect(await accountExists(fixture, redeemReq.operationPda)).to.equal(false);
+    expect(await accountExists(fixture, redeemReq.redeemResultPda!)).to.equal(false);
+  });
+
   it("[transfer] failed transfer preserves canonical state and versions", async () => {
     const fixture = await createFixture(harness);
     const beforeState = await getDecryptedState(fixture);
@@ -377,6 +466,17 @@ describe("Cvct Races", () => {
     expect(afterState.recipientBalanceVersion).to.equal(
       beforeState.recipientBalanceVersion,
     );
+  });
+
+  it("[transfer] cleanup closes failed transfer result after callback", async () => {
+    const fixture = await createFixture(harness);
+    const req = await requestTransferCvct(fixture, 1);
+    const result = await awaitTransferComputation(fixture, req);
+    expect(result.callbackApplied).to.equal(true);
+    expect(result.ok).to.equal(false);
+
+    await cleanupTransferResultCall(fixture, req.transferResultPda!);
+    expect(await accountExists(fixture, req.transferResultPda!)).to.equal(false);
   });
 
   it("[deposit] failed transfer does not invalidate staged deposit", async () => {

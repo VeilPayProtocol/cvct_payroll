@@ -2,21 +2,25 @@ import * as anchor from "@coral-xyz/anchor";
 import { expect } from "chai";
 import {
   awaitOperationComputation,
+  finalizeAndSettleDeposit,
+  requestDeposit,
+  requestRedeem,
+  settleRedeemCall,
+} from "./helpers/cvctFlows";
+import {
   createFixture,
   createHarness,
+  previewDepositShares,
+  previewRedeemAssets,
+  runLabeledRpc,
+  TEST_RPC_OPTIONS,
+} from "./helpers/cvctEnv";
+import {
+  getDecryptedState,
   expectRpcFailure,
   fetchPendingStatus,
   fetchPricingVersion,
-  finalizeAndSettleDeposit,
-  getDecryptedState,
-  previewDepositShares,
-  previewRedeemAssets,
-  requestDeposit,
-  requestRedeem,
-  runLabeledRpc,
-  settleRedeemCall,
-  TEST_RPC_OPTIONS,
-} from "./helpers/cvctHarness";
+} from "./helpers/cvctAssertions";
 import {
   assertKaminoArtifactsPresent,
   assertKaminoProgramsLoaded,

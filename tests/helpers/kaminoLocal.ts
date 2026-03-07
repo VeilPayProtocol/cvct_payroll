@@ -20,7 +20,7 @@ import {
   runLabeledRpc,
   sendAndConfirmHarnessTx,
   TEST_RPC_OPTIONS,
-} from "./cvctHarness";
+} from "./cvctEnv";
 
 export const KAMINO_VAULT_PROGRAM_ID = new PublicKey(
   "KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd",
