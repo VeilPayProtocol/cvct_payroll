@@ -1,8 +1,8 @@
-use anchor_lang::{prelude::*, InstructionData};
 use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
     program::invoke_signed,
 };
+use anchor_lang::{prelude::*, InstructionData};
 use anchor_spl::{
     associated_token::AssociatedToken,
     token::{transfer, Mint, Token, TokenAccount, Transfer},
@@ -53,9 +53,7 @@ pub mod cvct {
         Ok(())
     }
 
-    pub fn init_burn_and_withdraw_comp_def(
-        ctx: Context<InitBurnAndWithdrawCompDef>,
-    ) -> Result<()> {
+    pub fn init_burn_and_withdraw_comp_def(ctx: Context<InitBurnAndWithdrawCompDef>) -> Result<()> {
         // Registers the confidential circuit interface for withdrawals.
         init_comp_def(ctx.accounts, None, None)?;
         Ok(())
@@ -275,7 +273,10 @@ pub mod cvct {
                 && quoted_shares_out <= MAX_SAFE_OPERAND_U64,
             ErrorCode::MathOperandOutOfRange
         );
-        require!(quoted_shares_out >= min_shares_out, ErrorCode::InvalidAmount);
+        require!(
+            quoted_shares_out >= min_shares_out,
+            ErrorCode::InvalidAmount
+        );
 
         let pending_op = &mut ctx.accounts.pending_operation;
         let base_pricing_version = ctx.accounts.pricing_state.pricing_version;
@@ -441,7 +442,10 @@ pub mod cvct {
             pending_op.status == STATUS_REQUESTED,
             ErrorCode::InvalidOperationPhase
         );
-        require!(!pending_op.callback_applied, ErrorCode::CallbackAlreadyApplied);
+        require!(
+            !pending_op.callback_applied,
+            ErrorCode::CallbackAlreadyApplied
+        );
         require!(
             pending_result.operation_id == pending_op.operation_id,
             ErrorCode::InvalidPendingOperation
@@ -457,8 +461,7 @@ pub mod cvct {
         if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
             || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
             || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
-            || ctx.accounts.cvct_account.balance_version
-                != pending_result.base_user_balance_version
+            || ctx.accounts.cvct_account.balance_version != pending_result.base_user_balance_version
         {
             let computed_at_slot = Clock::get()?.slot;
             pending_result.ok = false;
@@ -556,10 +559,24 @@ pub mod cvct {
         if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
             || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
             || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
-            || ctx.accounts.cvct_account.balance_version
-                != pending_result.base_user_balance_version
+            || ctx.accounts.cvct_account.balance_version != pending_result.base_user_balance_version
         {
             pending_op.status = STATUS_INVALIDATED;
+            pending_op.ok = false;
+            pending_op.amount_out = 0;
+            pending_result.ok = false;
+            pending_result.shares_out = 0;
+            emit!(OperationSettledEvent {
+                operation_id: pending_op.operation_id,
+                kind: pending_op.kind,
+                final_status: pending_op.status,
+                amount_out: 0,
+            });
+            return Ok(());
+        }
+
+        if pending_op.deadline_slot > 0 && Clock::get()?.slot > pending_op.deadline_slot {
+            pending_op.status = OperationStatus::Expired as u8;
             pending_op.ok = false;
             pending_op.amount_out = 0;
             pending_result.ok = false;
@@ -637,7 +654,10 @@ pub mod cvct {
             pending_op.status == OperationStatus::Requested as u8,
             ErrorCode::InvalidOperationPhase
         );
-        require!(!pending_op.callback_applied, ErrorCode::InvalidOperationPhase);
+        require!(
+            !pending_op.callback_applied,
+            ErrorCode::InvalidOperationPhase
+        );
 
         pending_op.status = OperationStatus::Cancelled as u8;
         emit!(OperationSettledEvent {
@@ -663,7 +683,10 @@ pub mod cvct {
             pending_op.status == OperationStatus::Requested as u8,
             ErrorCode::InvalidOperationPhase
         );
-        require!(!pending_op.callback_applied, ErrorCode::InvalidOperationPhase);
+        require!(
+            !pending_op.callback_applied,
+            ErrorCode::InvalidOperationPhase
+        );
         require!(pending_op.deadline_slot > 0, ErrorCode::InvalidAmount);
         require!(
             Clock::get()?.slot > pending_op.deadline_slot,
@@ -862,7 +885,10 @@ pub mod cvct {
             pending_op.status == STATUS_REQUESTED,
             ErrorCode::InvalidOperationPhase
         );
-        require!(!pending_op.callback_applied, ErrorCode::CallbackAlreadyApplied);
+        require!(
+            !pending_op.callback_applied,
+            ErrorCode::CallbackAlreadyApplied
+        );
         require!(
             pending_result.operation_id == pending_op.operation_id,
             ErrorCode::InvalidPendingOperation
@@ -878,8 +904,7 @@ pub mod cvct {
         if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
             || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
             || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
-            || ctx.accounts.cvct_account.balance_version
-                != pending_result.base_user_balance_version
+            || ctx.accounts.cvct_account.balance_version != pending_result.base_user_balance_version
         {
             let computed_at_slot = Clock::get()?.slot;
             pending_result.ok = false;
@@ -977,8 +1002,7 @@ pub mod cvct {
         if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
             || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
             || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
-            || ctx.accounts.cvct_account.balance_version
-                != pending_result.base_user_balance_version
+            || ctx.accounts.cvct_account.balance_version != pending_result.base_user_balance_version
         {
             pending_op.status = STATUS_INVALIDATED;
             pending_op.ok = false;
@@ -1010,7 +1034,11 @@ pub mod cvct {
         );
 
         let cvct_mint_key = ctx.accounts.cvct_mint.key();
-        let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
+        let vault_seeds = &[
+            b"vault".as_ref(),
+            cvct_mint_key.as_ref(),
+            &[ctx.bumps.vault],
+        ];
         let signer_seeds = &[&vault_seeds[..]];
 
         transfer(
@@ -1066,7 +1094,10 @@ pub mod cvct {
         config: KaminoAdapterConfigArgs,
     ) -> Result<()> {
         let (expected_base_vault_authority, _) = Pubkey::find_program_address(
-            &[KAMINO_BASE_VAULT_AUTHORITY_SEED, config.vault_state.as_ref()],
+            &[
+                KAMINO_BASE_VAULT_AUTHORITY_SEED,
+                config.vault_state.as_ref(),
+            ],
             &KAMINO_VAULT_ID,
         );
         let (expected_token_vault, _) = Pubkey::find_program_address(
@@ -1077,14 +1108,10 @@ pub mod cvct {
             &[KAMINO_SHARES_SEED, config.vault_state.as_ref()],
             &KAMINO_VAULT_ID,
         );
-        let (expected_event_authority, _) = Pubkey::find_program_address(
-            &[KAMINO_EVENT_AUTHORITY_SEED],
-            &KAMINO_VAULT_ID,
-        );
-        let (expected_global_config, _) = Pubkey::find_program_address(
-            &[KAMINO_GLOBAL_CONFIG_STATE_SEED],
-            &KAMINO_VAULT_ID,
-        );
+        let (expected_event_authority, _) =
+            Pubkey::find_program_address(&[KAMINO_EVENT_AUTHORITY_SEED], &KAMINO_VAULT_ID);
+        let (expected_global_config, _) =
+            Pubkey::find_program_address(&[KAMINO_GLOBAL_CONFIG_STATE_SEED], &KAMINO_VAULT_ID);
 
         require!(
             config.base_vault_authority == expected_base_vault_authority,
@@ -1124,7 +1151,11 @@ pub mod cvct {
         require!(amount > 0, ErrorCode::ZeroAmount);
 
         let cvct_mint_key = ctx.accounts.cvct_mint.key();
-        let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
+        let vault_seeds = &[
+            b"vault".as_ref(),
+            cvct_mint_key.as_ref(),
+            &[ctx.bumps.vault],
+        ];
         let signer_seeds = &[&vault_seeds[..]];
 
         let ix_data = kamino_vault::instruction::Deposit {
@@ -1181,7 +1212,11 @@ pub mod cvct {
         require!(shares_amount > 0, ErrorCode::ZeroAmount);
 
         let cvct_mint_key = ctx.accounts.cvct_mint.key();
-        let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[ctx.bumps.vault]];
+        let vault_seeds = &[
+            b"vault".as_ref(),
+            cvct_mint_key.as_ref(),
+            &[ctx.bumps.vault],
+        ];
         let signer_seeds = &[&vault_seeds[..]];
 
         let ix_data = kamino_vault::instruction::WithdrawFromAvailable {
@@ -1373,6 +1408,11 @@ pub mod cvct {
         ctx: Context<TransferCvctCallback>,
         output: SignedComputationOutputs<TransferCvctOutput>,
     ) -> Result<()> {
+        require!(
+            ctx.accounts.from_cvct_account.key() != ctx.accounts.to_cvct_account.key(),
+            ErrorCode::SelfTransferNotAllowed
+        );
+
         let (from_balance, to_balance, ok) = match output.verify_output(
             &ctx.accounts.cluster_account,
             &ctx.accounts.computation_account,
@@ -1569,8 +1609,19 @@ pub struct PendingDepositResult {
 }
 
 impl PendingDepositResult {
-    pub const LEN: usize =
-        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1 + 8 + 8;
+    pub const LEN: usize = 8
+        + (32 * 2)
+        + 32
+        + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3)
+        + 16
+        + 16
+        + 16
+        + 1
+        + 8
+        + 8
+        + 1
+        + 8
+        + 8;
 }
 
 #[account]
@@ -1593,8 +1644,19 @@ pub struct PendingRedeemResult {
 }
 
 impl PendingRedeemResult {
-    pub const LEN: usize =
-        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1 + 8 + 8;
+    pub const LEN: usize = 8
+        + (32 * 2)
+        + 32
+        + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3)
+        + 16
+        + 16
+        + 16
+        + 1
+        + 8
+        + 8
+        + 1
+        + 8
+        + 8;
 }
 
 #[account]
@@ -2777,6 +2839,7 @@ pub struct TransferCvct<'info> {
     #[account(
         mut,
         constraint = to_cvct_account.cvct_mint == from_cvct_account.cvct_mint,
+        constraint = to_cvct_account.key() != from_cvct_account.key() @ ErrorCode::SelfTransferNotAllowed,
     )]
     pub to_cvct_account: Box<Account<'info, CvctAccount>>,
     #[account(
@@ -2951,6 +3014,8 @@ pub enum ErrorCode {
     InvalidOperationKind,
     #[msg("Invalid pending operation")]
     InvalidPendingOperation,
+    #[msg("Self-transfer is not allowed")]
+    SelfTransferNotAllowed,
     #[msg("Operation has not been computed yet")]
     OperationNotComputed,
     #[msg("Invalid operation phase for this instruction")]

@@ -11,6 +11,7 @@ import {
   finalizeAndSettleRedeem,
   requestDeposit,
   requestRedeem,
+  requestTransferCvct,
   transferCvct,
 } from "./helpers/cvctFlows";
 import {
@@ -50,7 +51,11 @@ describe("Cvct Smoke", () => {
       const minted = previewDepositShares(depositIn, supply, assets);
       if (minted === 0) continue;
 
-      const redeemed = previewRedeemAssets(minted, supply + minted, assets + depositIn);
+      const redeemed = previewRedeemAssets(
+        minted,
+        supply + minted,
+        assets + depositIn
+      );
       expect(redeemed).to.be.lte(depositIn);
     }
   });
@@ -73,7 +78,7 @@ describe("Cvct Smoke", () => {
     await assertTokenBalances(
       fixture,
       1_000_000 - fixture.depositAmount,
-      fixture.depositAmount,
+      fixture.depositAmount
     );
 
     const state = await getDecryptedState(fixture);
@@ -86,7 +91,7 @@ describe("Cvct Smoke", () => {
   it("[deposit] rejects zero asset requests", async () => {
     await expectRpcFailure(
       requestDeposit(seededFixture, 0, 1),
-      "Amount must be greater than zero",
+      "Amount must be greater than zero"
     );
   });
 
@@ -95,20 +100,24 @@ describe("Cvct Smoke", () => {
     const redeemQuote = previewRedeemAssets(
       fixture.burnAmount,
       fixture.depositAmount,
-      fixture.depositAmount,
+      fixture.depositAmount
     );
-    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    const redeemReq = await requestRedeem(
+      fixture,
+      fixture.burnAmount,
+      redeemQuote
+    );
 
     await finalizeAndSettleRedeem(fixture, redeemReq);
     const state = await getDecryptedState(fixture);
     expect(state.decryptedBalance).to.equal(
-      BigInt(fixture.depositAmount - fixture.burnAmount),
+      BigInt(fixture.depositAmount - fixture.burnAmount)
     );
     expect(state.decryptedSupply).to.equal(
-      BigInt(fixture.depositAmount - fixture.burnAmount),
+      BigInt(fixture.depositAmount - fixture.burnAmount)
     );
     expect(state.decryptedLocked).to.equal(
-      BigInt(fixture.depositAmount - fixture.burnAmount),
+      BigInt(fixture.depositAmount - fixture.burnAmount)
     );
     expect(state.balanceVersion).to.equal(2);
   });
@@ -116,7 +125,7 @@ describe("Cvct Smoke", () => {
   it("[redeem] rejects zero share requests", async () => {
     await expectRpcFailure(
       requestRedeem(seededFixture, 0, 1),
-      "Amount must be greater than zero",
+      "Amount must be greater than zero"
     );
   });
 
@@ -126,13 +135,40 @@ describe("Cvct Smoke", () => {
 
     const state = await getDecryptedState(fixture);
     expect(state.decryptedBalance).to.equal(
-      BigInt(fixture.depositAmount - fixture.transferAmount),
+      BigInt(fixture.depositAmount - fixture.transferAmount)
     );
-    expect(state.decryptedRecipientBalance).to.equal(BigInt(fixture.transferAmount));
+    expect(state.decryptedRecipientBalance).to.equal(
+      BigInt(fixture.transferAmount)
+    );
     expect(state.decryptedSupply).to.equal(BigInt(fixture.depositAmount));
     expect(state.decryptedLocked).to.equal(BigInt(fixture.depositAmount));
     expect(state.balanceVersion).to.equal(2);
     expect(state.recipientBalanceVersion).to.equal(1);
+  });
+
+  it("[transfer] rejects self-transfer without mutating balances", async () => {
+    const { fixture } = await createDepositedFixture(harness);
+    const beforeState = await getDecryptedState(fixture);
+
+    await expectRpcFailure(
+      requestTransferCvct(fixture, fixture.transferAmount, {
+        toCvctAccount: fixture.cvctAccountPda,
+        toEncPubkey: fixture.accountEncPubkey,
+      }),
+      "Self-transfer is not allowed"
+    );
+
+    const afterState = await getDecryptedState(fixture);
+    expect(afterState.decryptedBalance).to.equal(beforeState.decryptedBalance);
+    expect(afterState.decryptedRecipientBalance).to.equal(
+      beforeState.decryptedRecipientBalance
+    );
+    expect(afterState.decryptedSupply).to.equal(beforeState.decryptedSupply);
+    expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
+    expect(afterState.balanceVersion).to.equal(beforeState.balanceVersion);
+    expect(afterState.recipientBalanceVersion).to.equal(
+      beforeState.recipientBalanceVersion
+    );
   });
 
   it("[invariant] global accounting invariants hold after deposit+redeem", async () => {
@@ -140,9 +176,13 @@ describe("Cvct Smoke", () => {
     const redeemQuote = previewRedeemAssets(
       fixture.burnAmount,
       fixture.depositAmount,
-      fixture.depositAmount,
+      fixture.depositAmount
     );
-    const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
+    const redeemReq = await requestRedeem(
+      fixture,
+      fixture.burnAmount,
+      redeemQuote
+    );
     await finalizeAndSettleRedeem(fixture, redeemReq);
 
     const state = await getDecryptedState(fixture);
@@ -153,13 +193,13 @@ describe("Cvct Smoke", () => {
       state.decryptedSupply,
       state.decryptedLocked,
       expectedSupply,
-      expectedLocked,
+      expectedLocked
     );
 
     await assertTokenBalances(
       fixture,
       1_000_000 - fixture.depositAmount + fixture.burnAmount,
-      fixture.depositAmount - fixture.burnAmount,
+      fixture.depositAmount - fixture.burnAmount
     );
   });
 });

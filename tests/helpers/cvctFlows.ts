@@ -1,5 +1,6 @@
 import type { Fixture, Harness, RequestResult } from "./cvctEnv";
 import {
+  advancePastSlot,
   awaitOperationComputation,
   awaitTransferComputation,
   cancelDepositIntentCall,
@@ -27,9 +28,13 @@ import {
 } from "./cvctCore";
 import { createFixture } from "./cvctEnv";
 import { previewDepositShares, previewRedeemAssets } from "./cvctEnv";
-import { waitForPendingDepositCallback, waitForPendingRedeemCallback } from "./cvctAssertions";
+import {
+  waitForPendingDepositCallback,
+  waitForPendingRedeemCallback,
+} from "./cvctAssertions";
 
 export {
+  advancePastSlot,
   awaitOperationComputation,
   awaitTransferComputation,
   cancelDepositIntentCall,
@@ -58,7 +63,7 @@ export {
 
 export async function createDepositedFixture(
   harness: Harness,
-  amount?: number,
+  amount?: number
 ): Promise<{ fixture: Fixture; depositReq: RequestResult }> {
   const fixture = await createFixture(harness);
   const depositAmount = amount ?? fixture.depositAmount;
@@ -70,26 +75,34 @@ export async function createDepositedFixture(
 
 export async function stageDepositSuccess(
   fixture: Fixture,
-  amount?: number,
+  amount?: number
 ): Promise<RequestResult> {
   const depositAmount = amount ?? fixture.depositAmount;
   const quote = previewDepositShares(depositAmount, 0, 0);
   const req = await requestDeposit(fixture, depositAmount, quote);
-  await waitForPendingDepositCallback(fixture, req.operationPda, req.depositResultPda!);
+  await waitForPendingDepositCallback(
+    fixture,
+    req.operationPda,
+    req.depositResultPda!
+  );
   return req;
 }
 
 export async function stageRedeemSuccess(
   fixture: Fixture,
-  sharesIn?: number,
+  sharesIn?: number
 ): Promise<RequestResult> {
   const redeemShares = sharesIn ?? fixture.burnAmount;
   const redeemQuote = previewRedeemAssets(
     redeemShares,
     fixture.depositAmount,
-    fixture.depositAmount,
+    fixture.depositAmount
   );
   const req = await requestRedeem(fixture, redeemShares, redeemQuote);
-  await waitForPendingRedeemCallback(fixture, req.operationPda, req.redeemResultPda!);
+  await waitForPendingRedeemCallback(
+    fixture,
+    req.operationPda,
+    req.redeemResultPda!
+  );
   return req;
 }
