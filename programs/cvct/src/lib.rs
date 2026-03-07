@@ -197,6 +197,7 @@ pub mod cvct {
                 owner_enc_pubkey,
                 balance: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
                 balance_nonce: 0,
+                balance_version: 0,
             });
         }
 
@@ -278,6 +279,7 @@ pub mod cvct {
 
         let pending_op = &mut ctx.accounts.pending_operation;
         let base_pricing_version = ctx.accounts.pricing_state.pricing_version;
+        let base_user_balance_version = ctx.accounts.cvct_account.balance_version;
         pending_op.set_inner(PendingOperation {
             operation_id,
             cvct_mint: ctx.accounts.cvct_mint.key(),
@@ -294,6 +296,7 @@ pub mod cvct {
             amount_out: 0,
             deadline_slot,
             base_pricing_version,
+            base_user_balance_version,
         });
         let pending_result = &mut ctx.accounts.pending_deposit_result;
         pending_result.set_inner(PendingDepositResult {
@@ -311,6 +314,7 @@ pub mod cvct {
             computed_at_slot: 0,
             callback_applied: false,
             base_pricing_version,
+            base_user_balance_version,
         });
         emit!(OperationRequestedEvent {
             operation_id,
@@ -452,6 +456,9 @@ pub mod cvct {
         );
         if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
             || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
+            || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
+            || ctx.accounts.cvct_account.balance_version
+                != pending_result.base_user_balance_version
         {
             let computed_at_slot = Clock::get()?.slot;
             pending_result.ok = false;
@@ -548,6 +555,9 @@ pub mod cvct {
         );
         if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
             || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
+            || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
+            || ctx.accounts.cvct_account.balance_version
+                != pending_result.base_user_balance_version
         {
             pending_op.status = STATUS_INVALIDATED;
             emit!(OperationSettledEvent {
@@ -588,6 +598,10 @@ pub mod cvct {
 
         cvct_account.balance = pending_result.balance;
         cvct_account.balance_nonce = pending_result.balance_nonce;
+        cvct_account.balance_version = cvct_account
+            .balance_version
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidAmount)?;
         cvct_mint.total_supply = pending_result.total_supply;
         cvct_mint.total_supply_nonce = pending_result.total_supply_nonce;
         vault.total_locked = pending_result.total_locked;
@@ -683,6 +697,7 @@ pub mod cvct {
 
         let pending_op = &mut ctx.accounts.pending_operation;
         let base_pricing_version = ctx.accounts.pricing_state.pricing_version;
+        let base_user_balance_version = ctx.accounts.cvct_account.balance_version;
         pending_op.set_inner(PendingOperation {
             operation_id,
             cvct_mint: ctx.accounts.cvct_mint.key(),
@@ -699,6 +714,7 @@ pub mod cvct {
             amount_out: 0,
             deadline_slot: 0,
             base_pricing_version,
+            base_user_balance_version,
         });
         let pending_result = &mut ctx.accounts.pending_redeem_result;
         pending_result.set_inner(PendingRedeemResult {
@@ -716,6 +732,7 @@ pub mod cvct {
             computed_at_slot: 0,
             callback_applied: false,
             base_pricing_version,
+            base_user_balance_version,
         });
         emit!(OperationRequestedEvent {
             operation_id,
@@ -852,6 +869,9 @@ pub mod cvct {
         );
         if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
             || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
+            || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
+            || ctx.accounts.cvct_account.balance_version
+                != pending_result.base_user_balance_version
         {
             let computed_at_slot = Clock::get()?.slot;
             pending_result.ok = false;
@@ -948,6 +968,9 @@ pub mod cvct {
         );
         if ctx.accounts.pricing_state.pricing_version != pending_op.base_pricing_version
             || ctx.accounts.pricing_state.pricing_version != pending_result.base_pricing_version
+            || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
+            || ctx.accounts.cvct_account.balance_version
+                != pending_result.base_user_balance_version
         {
             pending_op.status = STATUS_INVALIDATED;
             emit!(OperationSettledEvent {
@@ -997,6 +1020,10 @@ pub mod cvct {
 
         cvct_account.balance = pending_result.balance;
         cvct_account.balance_nonce = pending_result.balance_nonce;
+        cvct_account.balance_version = cvct_account
+            .balance_version
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidAmount)?;
         cvct_mint.total_supply = pending_result.total_supply;
         cvct_mint.total_supply_nonce = pending_result.total_supply_nonce;
         vault.total_locked = pending_result.total_locked;
@@ -1242,6 +1269,19 @@ pub mod cvct {
         to_new_balance_nonce: u128,
     ) -> Result<()> {
         require!(amount > 0, ErrorCode::ZeroAmount);
+        let pending_transfer_result = &mut ctx.accounts.pending_transfer_result;
+        pending_transfer_result.set_inner(PendingTransferResult {
+            from_account: ctx.accounts.from_cvct_account.key(),
+            to_account: ctx.accounts.to_cvct_account.key(),
+            from_balance: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+            from_balance_nonce: 0,
+            to_balance: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+            to_balance_nonce: 0,
+            ok: false,
+            base_from_balance_version: ctx.accounts.from_cvct_account.balance_version,
+            base_to_balance_version: ctx.accounts.to_cvct_account.balance_version,
+            callback_applied: false,
+        });
 
         let args = ArgBuilder::new()
             // Sender balance.
@@ -1289,6 +1329,10 @@ pub mod cvct {
                         pubkey: ctx.accounts.to_cvct_account.key(),
                         is_writable: true,
                     },
+                    CallbackAccount {
+                        pubkey: ctx.accounts.pending_transfer_result.key(),
+                        is_writable: true,
+                    },
                 ],
             )?],
             1,
@@ -1303,7 +1347,7 @@ pub mod cvct {
         ctx: Context<TransferCvctCallback>,
         output: SignedComputationOutputs<TransferCvctOutput>,
     ) -> Result<()> {
-        let (from_balance, to_balance, _ok) = match output.verify_output(
+        let (from_balance, to_balance, ok) = match output.verify_output(
             &ctx.accounts.cluster_account,
             &ctx.accounts.computation_account,
         ) {
@@ -1320,12 +1364,45 @@ pub mod cvct {
 
         let from_cvct_account = &mut ctx.accounts.from_cvct_account;
         let to_cvct_account = &mut ctx.accounts.to_cvct_account;
+        let pending_transfer_result = &mut ctx.accounts.pending_transfer_result;
+
+        require!(
+            pending_transfer_result.from_account == from_cvct_account.key(),
+            ErrorCode::InvalidPendingOperation
+        );
+        require!(
+            pending_transfer_result.to_account == to_cvct_account.key(),
+            ErrorCode::InvalidPendingOperation
+        );
+
+        if from_cvct_account.balance_version != pending_transfer_result.base_from_balance_version
+            || to_cvct_account.balance_version != pending_transfer_result.base_to_balance_version
+        {
+            pending_transfer_result.ok = false;
+            pending_transfer_result.callback_applied = true;
+            return Ok(());
+        }
+
+        pending_transfer_result.from_balance = from_balance.ciphertexts;
+        pending_transfer_result.from_balance_nonce = from_balance.nonce;
+        pending_transfer_result.to_balance = to_balance.ciphertexts;
+        pending_transfer_result.to_balance_nonce = to_balance.nonce;
+        pending_transfer_result.ok = ok;
+        pending_transfer_result.callback_applied = true;
 
         from_cvct_account.balance = from_balance.ciphertexts;
         from_cvct_account.balance_nonce = from_balance.nonce;
+        from_cvct_account.balance_version = from_cvct_account
+            .balance_version
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidAmount)?;
 
         to_cvct_account.balance = to_balance.ciphertexts;
         to_cvct_account.balance_nonce = to_balance.nonce;
+        to_cvct_account.balance_version = to_cvct_account
+            .balance_version
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidAmount)?;
 
         Ok(())
     }
@@ -1384,10 +1461,12 @@ pub struct CvctAccount {
     pub balance: [[u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
     /// Nonce used with the encrypted balance.
     pub balance_nonce: u128,
+    /// Monotonic version for optimistic concurrency on balance writes.
+    pub balance_version: u64,
 }
 
 impl CvctAccount {
-    pub const LEN: usize = 32 + 32 + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS) + 16;
+    pub const LEN: usize = 32 + 32 + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS) + 16 + 8;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Eq, PartialEq)]
@@ -1430,10 +1509,11 @@ pub struct PendingOperation {
     /// Deadline slot for deposits, zero for redeems.
     pub deadline_slot: u64,
     pub base_pricing_version: u64,
+    pub base_user_balance_version: u64,
 }
 
 impl PendingOperation {
-    pub const LEN: usize = 8 + (32 * 4) + 1 + 1 + 1 + 8 + 1 + 8 + 8 + 8 + 8 + 8;
+    pub const LEN: usize = 8 + (32 * 4) + 1 + 1 + 1 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 8;
 }
 
 #[account]
@@ -1452,11 +1532,12 @@ pub struct PendingDepositResult {
     pub computed_at_slot: u64,
     pub callback_applied: bool,
     pub base_pricing_version: u64,
+    pub base_user_balance_version: u64,
 }
 
 impl PendingDepositResult {
     pub const LEN: usize =
-        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1 + 8;
+        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1 + 8 + 8;
 }
 
 #[account]
@@ -1475,11 +1556,31 @@ pub struct PendingRedeemResult {
     pub computed_at_slot: u64,
     pub callback_applied: bool,
     pub base_pricing_version: u64,
+    pub base_user_balance_version: u64,
 }
 
 impl PendingRedeemResult {
     pub const LEN: usize =
-        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1 + 8;
+        8 + (32 * 2) + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS * 3) + 16 + 16 + 16 + 1 + 8 + 8 + 1 + 8 + 8;
+}
+
+#[account]
+pub struct PendingTransferResult {
+    pub from_account: Pubkey,
+    pub to_account: Pubkey,
+    pub from_balance: [[u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+    pub from_balance_nonce: u128,
+    pub to_balance: [[u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
+    pub to_balance_nonce: u128,
+    pub ok: bool,
+    pub base_from_balance_version: u64,
+    pub base_to_balance_version: u64,
+    pub callback_applied: bool,
+}
+
+impl PendingTransferResult {
+    pub const LEN: usize =
+        (32 * 2) + (32 * ENCRYPTED_U128_CIPHERTEXTS * 2) + 16 + 16 + 1 + 8 + 8 + 1;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -2583,6 +2684,19 @@ pub struct TransferCvct<'info> {
         constraint = to_cvct_account.cvct_mint == from_cvct_account.cvct_mint,
     )]
     pub to_cvct_account: Box<Account<'info, CvctAccount>>,
+    #[account(
+        init,
+        payer = user,
+        space = 8 + PendingTransferResult::LEN,
+        seeds = [
+            b"pending_transfer_result",
+            from_cvct_account.key().as_ref(),
+            to_cvct_account.key().as_ref(),
+            computation_account.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_transfer_result: Box<Account<'info, PendingTransferResult>>,
 }
 
 #[callback_accounts("transfer_cvct")]
@@ -2611,6 +2725,17 @@ pub struct TransferCvctCallback<'info> {
     #[account(mut)]
     /// Recipient CVCT account to update encrypted balance.
     pub to_cvct_account: Box<Account<'info, CvctAccount>>,
+    #[account(
+        mut,
+        seeds = [
+            b"pending_transfer_result",
+            from_cvct_account.key().as_ref(),
+            to_cvct_account.key().as_ref(),
+            computation_account.key().as_ref(),
+        ],
+        bump,
+    )]
+    pub pending_transfer_result: Box<Account<'info, PendingTransferResult>>,
 }
 
 #[init_computation_definition_accounts("init_mint_state", payer)]

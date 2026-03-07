@@ -57,6 +57,19 @@ const VIRTUAL_SHARE_OFFSET = 1;
  * 5) Keep logs off by default; pass `createHarness(true)` only for local debugging.
  */
 let compDefsInitialized = false;
+let seededFastFixturePromise: Promise<Fixture> | null = null;
+const timingEnabled = process.env.CVCT_DEBUG_TIMINGS === "1";
+const TEST_COMMITMENT: anchor.web3.Commitment = "confirmed";
+const TEST_CONFIRM_TIMEOUT_MS = 180_000;
+export const TEST_RPC_OPTIONS = {
+  skipPreflight: true,
+  commitment: TEST_COMMITMENT,
+} as const;
+const TEST_SEND_OPTIONS = {
+  skipPreflight: true,
+  commitment: TEST_COMMITMENT,
+  preflightCommitment: TEST_COMMITMENT,
+} as const;
 
 export type Harness = {
   connection: anchor.web3.Connection;
@@ -98,6 +111,7 @@ export type RequestResult = {
   operationPda: PublicKey;
   depositResultPda?: PublicKey;
   redeemResultPda?: PublicKey;
+  transferResultPda?: PublicKey;
   computationOffset: anchor.BN;
   deadlineSlot?: anchor.BN;
 };
@@ -169,13 +183,14 @@ async function getMXEPublicKeyWithRetry(
 
 export async function createHarness(debug = false): Promise<Harness> {
   const connection = new anchor.web3.Connection("http://127.0.0.1:8899", {
-    commitment: "confirmed",
+    commitment: TEST_COMMITMENT,
     disableRetryOnRateLimit: true,
+    confirmTransactionInitialTimeout: TEST_CONFIRM_TIMEOUT_MS,
   });
   const wallet = anchor.Wallet.local();
   const provider = new anchor.AnchorProvider(connection, wallet, {
-    commitment: "confirmed",
-    preflightCommitment: "confirmed",
+    commitment: TEST_COMMITMENT,
+    preflightCommitment: TEST_COMMITMENT,
   });
   anchor.setProvider(provider);
   const program = anchor.workspace.Cvct as Program<Cvct>;
@@ -214,29 +229,42 @@ function log(harness: Harness, ...args: unknown[]) {
   }
 }
 
+async function timed<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    return await fn();
+  } finally {
+    if (timingEnabled) {
+      console.log(`[cvct-timing] ${label}: ${Date.now() - startedAt}ms`);
+    }
+  }
+}
+
 export async function ensureCompDefs(harness: Harness): Promise<void> {
   if (compDefsInitialized) {
     return;
   }
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-  await initMintStateCompDef(harness.program, harness.payer);
-  await initAccountStateCompDef(harness.program, harness.payer);
-  await initDepositAndMintCompDef(harness.program, harness.payer);
-  await initBurnAndWithdrawCompDef(harness.program, harness.payer);
-  await initTransferCvctCompDef(harness.program, harness.payer);
+  await timed("ensureCompDefs", async () => {
+    await initMintStateCompDef(harness.program, harness.payer);
+    await initAccountStateCompDef(harness.program, harness.payer);
+    await initDepositAndMintCompDef(harness.program, harness.payer);
+    await initBurnAndWithdrawCompDef(harness.program, harness.payer);
+    await initTransferCvctCompDef(harness.program, harness.payer);
+  });
   compDefsInitialized = true;
 }
 
 export async function createFixture(harness: Harness): Promise<Fixture> {
-  await ensureCompDefs(harness);
+  return timed("createFixture", async () => {
+    await ensureCompDefs(harness);
 
-  const authoritySigner = anchor.web3.Keypair.generate();
-  await transferLamports(
-    harness.provider.connection,
-    harness.payer.payer,
-    authoritySigner.publicKey,
-    anchor.web3.LAMPORTS_PER_SOL,
-  );
+    const authoritySigner = anchor.web3.Keypair.generate();
+    await transferLamports(
+      harness.provider.connection,
+      harness.payer.payer,
+      authoritySigner.publicKey,
+      anchor.web3.LAMPORTS_PER_SOL,
+    );
 
   const backingMint = await createMint(
     harness.provider.connection,
@@ -327,7 +355,7 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
         arciumProgram: harness.arciumProgramId,
       })
       .signers([authoritySigner])
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
+      .rpc(TEST_RPC_OPTIONS),
     "initializeCvctMint",
     harness.provider.connection,
   );
@@ -385,7 +413,7 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
         clockAccount: harness.clockAccount,
         arciumProgram: harness.arciumProgramId,
       })
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
+      .rpc(TEST_RPC_OPTIONS),
     "initializeCvctAccountOwner",
     harness.provider.connection,
   );
@@ -451,7 +479,7 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
         arciumProgram: harness.arciumProgramId,
       })
       .signers([recipient])
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
+      .rpc(TEST_RPC_OPTIONS),
     "initializeCvctAccountRecipient",
     harness.provider.connection,
   );
@@ -463,29 +491,37 @@ export async function createFixture(harness: Harness): Promise<Fixture> {
     "confirmed",
   );
 
-  log(harness, "Fixture created", cvctMintPda.toBase58());
+    log(harness, "Fixture created", cvctMintPda.toBase58());
 
-  return {
-    harness,
-    authoritySigner,
-    backingMint,
-    cvctMintPda,
-    pricingStatePda,
-    vaultPda,
-    vaultTokenAccount,
-    userTokenAccount: userTokenAccount.address,
-    cvctAccountPda,
-    recipientCvctAccountPda,
-    authorityKey,
-    authorityPubkey,
-    accountEncKey,
-    accountEncPubkey,
-    recipientEncKey,
-    recipientEncPubkey,
-    depositAmount: 500_000,
-    burnAmount: 200_000,
-    transferAmount: 100_000,
-  };
+    return {
+      harness,
+      authoritySigner,
+      backingMint,
+      cvctMintPda,
+      pricingStatePda,
+      vaultPda,
+      vaultTokenAccount,
+      userTokenAccount: userTokenAccount.address,
+      cvctAccountPda,
+      recipientCvctAccountPda,
+      authorityKey,
+      authorityPubkey,
+      accountEncKey,
+      accountEncPubkey,
+      recipientEncKey,
+      recipientEncPubkey,
+      depositAmount: 500_000,
+      burnAmount: 200_000,
+      transferAmount: 100_000,
+    };
+  });
+}
+
+export async function createSeededFastFixture(harness: Harness): Promise<Fixture> {
+  if (!seededFastFixturePromise) {
+    seededFastFixturePromise = createFixture(harness);
+  }
+  return seededFastFixturePromise;
 }
 
 export async function requestDeposit(
@@ -494,14 +530,15 @@ export async function requestDeposit(
   minSharesOut: number,
   options?: { quotedSharesOut?: number; deadlineSlot?: anchor.BN },
 ): Promise<RequestResult> {
-  const { harness } = fixture;
-  const cvctMintBefore = await harness.program.account.cvctMint.fetch(
-    fixture.cvctMintPda,
-  );
-  const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
-  const accountBefore = await harness.program.account.cvctAccount.fetch(
-    fixture.cvctAccountPda,
-  );
+  return timed("requestDeposit", async () => {
+    const { harness } = fixture;
+    const cvctMintBefore = await harness.program.account.cvctMint.fetch(
+      fixture.cvctMintPda,
+    );
+    const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
+    const accountBefore = await harness.program.account.cvctAccount.fetch(
+      fixture.cvctAccountPda,
+    );
 
   const computationOffset = new anchor.BN(randomBytes(8));
   const operationId = new anchor.BN(randomBytes(8));
@@ -532,59 +569,60 @@ export async function requestDeposit(
   const slot = await harness.connection.getSlot("confirmed");
   const deadlineSlot = options?.deadlineSlot ?? new anchor.BN(slot + 500);
 
-  await rpcWithLogs(
-    (harness.program.methods as any)
-      .requestDepositIntent(
-        computationOffset,
-        operationId,
-        new anchor.BN(assetsIn),
-        new anchor.BN(minSharesOut),
-        new anchor.BN(quotedSharesOut),
-        deadlineSlot,
-        Array.from(fixture.accountEncPubkey),
-        accountBefore.balanceNonce,
-        newBalanceNonce.bn,
-        Array.from(fixture.authorityPubkey),
-        cvctMintBefore.totalSupplyNonce,
-        newSupplyNonce.bn,
-        Array.from(fixture.authorityPubkey),
-        vaultBefore.totalLockedNonce,
-        newLockedNonce.bn,
-      )
-      .accountsPartial({
-        user: harness.payer.publicKey,
-        cvctMint: fixture.cvctMintPda,
-        pricingState: fixture.pricingStatePda,
-        vault: fixture.vaultPda,
-        cvctAccount: fixture.cvctAccountPda,
-        userTokenAccount: fixture.userTokenAccount,
-        vaultTokenAccount: fixture.vaultTokenAccount,
-        pendingOperation: operationPda,
-        pendingDepositResult: depositResultPda,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        mxeAccount: getMXEAccAddress(harness.program.programId),
-        mempoolAccount: getMempoolAccAddress(harness.arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(harness.arciumEnv.arciumClusterOffset),
-        computationAccount: getComputationAccAddress(
-          harness.arciumEnv.arciumClusterOffset,
+    await rpcWithLogs(
+      (harness.program.methods as any)
+        .requestDepositIntent(
           computationOffset,
-        ),
-        compDefAccount: getCompDefAccAddress(
-          harness.program.programId,
-          Buffer.from(compDefOffset).readUInt32LE(),
-        ),
-        clusterAccount: getClusterAccAddress(harness.arciumEnv.arciumClusterOffset),
-        poolAccount: harness.poolAccount,
-        clockAccount: harness.clockAccount,
-        arciumProgram: harness.arciumProgramId,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "requestDepositIntent",
-    harness.provider.connection,
-  );
+          operationId,
+          new anchor.BN(assetsIn),
+          new anchor.BN(minSharesOut),
+          new anchor.BN(quotedSharesOut),
+          deadlineSlot,
+          Array.from(fixture.accountEncPubkey),
+          accountBefore.balanceNonce,
+          newBalanceNonce.bn,
+          Array.from(fixture.authorityPubkey),
+          cvctMintBefore.totalSupplyNonce,
+          newSupplyNonce.bn,
+          Array.from(fixture.authorityPubkey),
+          vaultBefore.totalLockedNonce,
+          newLockedNonce.bn,
+        )
+        .accountsPartial({
+          user: harness.payer.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          pricingState: fixture.pricingStatePda,
+          vault: fixture.vaultPda,
+          cvctAccount: fixture.cvctAccountPda,
+          userTokenAccount: fixture.userTokenAccount,
+          vaultTokenAccount: fixture.vaultTokenAccount,
+          pendingOperation: operationPda,
+          pendingDepositResult: depositResultPda,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          mxeAccount: getMXEAccAddress(harness.program.programId),
+          mempoolAccount: getMempoolAccAddress(harness.arciumEnv.arciumClusterOffset),
+          executingPool: getExecutingPoolAccAddress(harness.arciumEnv.arciumClusterOffset),
+          computationAccount: getComputationAccAddress(
+            harness.arciumEnv.arciumClusterOffset,
+            computationOffset,
+          ),
+          compDefAccount: getCompDefAccAddress(
+            harness.program.programId,
+            Buffer.from(compDefOffset).readUInt32LE(),
+          ),
+          clusterAccount: getClusterAccAddress(harness.arciumEnv.arciumClusterOffset),
+          poolAccount: harness.poolAccount,
+          clockAccount: harness.clockAccount,
+          arciumProgram: harness.arciumProgramId,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc(TEST_RPC_OPTIONS),
+      "requestDepositIntent",
+      harness.provider.connection,
+    );
 
-  return { operationPda, depositResultPda, computationOffset, deadlineSlot };
+    return { operationPda, depositResultPda, computationOffset, deadlineSlot };
+  });
 }
 
 export async function requestRedeem(
@@ -592,14 +630,15 @@ export async function requestRedeem(
   sharesIn: number,
   quotedAssetsOut: number,
 ): Promise<RequestResult> {
-  const { harness } = fixture;
-  const cvctMintBefore = await harness.program.account.cvctMint.fetch(
-    fixture.cvctMintPda,
-  );
-  const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
-  const accountBefore = await harness.program.account.cvctAccount.fetch(
-    fixture.cvctAccountPda,
-  );
+  return timed("requestRedeem", async () => {
+    const { harness } = fixture;
+    const cvctMintBefore = await harness.program.account.cvctMint.fetch(
+      fixture.cvctMintPda,
+    );
+    const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
+    const accountBefore = await harness.program.account.cvctAccount.fetch(
+      fixture.cvctAccountPda,
+    );
 
   const computationOffset = new anchor.BN(randomBytes(8));
   const operationId = new anchor.BN(randomBytes(8));
@@ -627,113 +666,118 @@ export async function requestRedeem(
   const newLockedNonce = randomNonce();
   const compDefOffset = getCompDefAccOffset(COMP_DEF_BURN);
 
-  await rpcWithLogs(
-    (harness.program.methods as any)
-      .requestRedeemIntent(
-        computationOffset,
-        operationId,
-        new anchor.BN(sharesIn),
-        new anchor.BN(quotedAssetsOut),
-        Array.from(fixture.accountEncPubkey),
-        accountBefore.balanceNonce,
-        newBalanceNonce.bn,
-        Array.from(fixture.authorityPubkey),
-        cvctMintBefore.totalSupplyNonce,
-        newSupplyNonce.bn,
-        Array.from(fixture.authorityPubkey),
-        vaultBefore.totalLockedNonce,
-        newLockedNonce.bn,
-      )
-      .accountsPartial({
-        user: harness.payer.publicKey,
-        cvctMint: fixture.cvctMintPda,
-        pricingState: fixture.pricingStatePda,
-        vault: fixture.vaultPda,
-        cvctAccount: fixture.cvctAccountPda,
-        userTokenAccount: fixture.userTokenAccount,
-        vaultTokenAccount: fixture.vaultTokenAccount,
-        pendingOperation: operationPda,
-        pendingRedeemResult: redeemResultPda,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        mxeAccount: getMXEAccAddress(harness.program.programId),
-        mempoolAccount: getMempoolAccAddress(harness.arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(harness.arciumEnv.arciumClusterOffset),
-        computationAccount: getComputationAccAddress(
-          harness.arciumEnv.arciumClusterOffset,
+    await rpcWithLogs(
+      (harness.program.methods as any)
+        .requestRedeemIntent(
           computationOffset,
-        ),
-        compDefAccount: getCompDefAccAddress(
-          harness.program.programId,
-          Buffer.from(compDefOffset).readUInt32LE(),
-        ),
-        clusterAccount: getClusterAccAddress(harness.arciumEnv.arciumClusterOffset),
-        poolAccount: harness.poolAccount,
-        clockAccount: harness.clockAccount,
-        arciumProgram: harness.arciumProgramId,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "requestRedeemIntent",
-    harness.provider.connection,
-  );
+          operationId,
+          new anchor.BN(sharesIn),
+          new anchor.BN(quotedAssetsOut),
+          Array.from(fixture.accountEncPubkey),
+          accountBefore.balanceNonce,
+          newBalanceNonce.bn,
+          Array.from(fixture.authorityPubkey),
+          cvctMintBefore.totalSupplyNonce,
+          newSupplyNonce.bn,
+          Array.from(fixture.authorityPubkey),
+          vaultBefore.totalLockedNonce,
+          newLockedNonce.bn,
+        )
+        .accountsPartial({
+          user: harness.payer.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          pricingState: fixture.pricingStatePda,
+          vault: fixture.vaultPda,
+          cvctAccount: fixture.cvctAccountPda,
+          userTokenAccount: fixture.userTokenAccount,
+          vaultTokenAccount: fixture.vaultTokenAccount,
+          pendingOperation: operationPda,
+          pendingRedeemResult: redeemResultPda,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          mxeAccount: getMXEAccAddress(harness.program.programId),
+          mempoolAccount: getMempoolAccAddress(harness.arciumEnv.arciumClusterOffset),
+          executingPool: getExecutingPoolAccAddress(harness.arciumEnv.arciumClusterOffset),
+          computationAccount: getComputationAccAddress(
+            harness.arciumEnv.arciumClusterOffset,
+            computationOffset,
+          ),
+          compDefAccount: getCompDefAccAddress(
+            harness.program.programId,
+            Buffer.from(compDefOffset).readUInt32LE(),
+          ),
+          clusterAccount: getClusterAccAddress(harness.arciumEnv.arciumClusterOffset),
+          poolAccount: harness.poolAccount,
+          clockAccount: harness.clockAccount,
+          arciumProgram: harness.arciumProgramId,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc(TEST_RPC_OPTIONS),
+      "requestRedeemIntent",
+      harness.provider.connection,
+    );
 
-  return { operationPda, redeemResultPda, computationOffset };
+    return { operationPda, redeemResultPda, computationOffset };
+  });
 }
 
 export async function finalizeAndSettleDeposit(
   fixture: Fixture,
   req: RequestResult,
 ): Promise<void> {
-  const { harness } = fixture;
-  await awaitOperationComputation(fixture, req);
+  await timed("finalizeAndSettleDeposit", async () => {
+    const { harness } = fixture;
+    await awaitOperationComputation(fixture, req);
 
-  await rpcWithLogs(
-    (harness.program.methods as any)
-      .settleDepositCommit()
-      .accountsPartial({
-        user: harness.payer.publicKey,
-        cvctMint: fixture.cvctMintPda,
-        pricingState: fixture.pricingStatePda,
-        vault: fixture.vaultPda,
-        pendingOperation: req.operationPda,
-        pendingDepositResult: req.depositResultPda,
-        vaultTokenAccount: fixture.vaultTokenAccount,
-        userTokenAccount: fixture.userTokenAccount,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([harness.payer.payer])
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "settleDepositCommit",
-    harness.provider.connection,
-  );
+    await rpcWithLogs(
+      (harness.program.methods as any)
+        .settleDepositCommit()
+        .accountsPartial({
+          user: harness.payer.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          pricingState: fixture.pricingStatePda,
+          vault: fixture.vaultPda,
+          pendingOperation: req.operationPda,
+          pendingDepositResult: req.depositResultPda,
+          vaultTokenAccount: fixture.vaultTokenAccount,
+          userTokenAccount: fixture.userTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([harness.payer.payer])
+        .rpc(TEST_RPC_OPTIONS),
+      "settleDepositCommit",
+      harness.provider.connection,
+    );
+  });
 }
 
 export async function finalizeAndSettleRedeem(
   fixture: Fixture,
   req: RequestResult,
 ): Promise<void> {
-  const { harness } = fixture;
-  await awaitOperationComputation(fixture, req);
+  await timed("finalizeAndSettleRedeem", async () => {
+    const { harness } = fixture;
+    await awaitOperationComputation(fixture, req);
 
-  await rpcWithLogs(
-    (harness.program.methods as any)
-      .settleRedeemCommit()
-      .accountsPartial({
-        executor: harness.payer.publicKey,
-        cvctMint: fixture.cvctMintPda,
-        pricingState: fixture.pricingStatePda,
-        vault: fixture.vaultPda,
-        pendingOperation: req.operationPda,
-        pendingRedeemResult: req.redeemResultPda,
-        cvctAccount: fixture.cvctAccountPda,
-        vaultTokenAccount: fixture.vaultTokenAccount,
-        userTokenAccount: fixture.userTokenAccount,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "settleRedeemCommit",
-    harness.provider.connection,
-  );
+    await rpcWithLogs(
+      (harness.program.methods as any)
+        .settleRedeemCommit()
+        .accountsPartial({
+          executor: harness.payer.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          pricingState: fixture.pricingStatePda,
+          vault: fixture.vaultPda,
+          pendingOperation: req.operationPda,
+          pendingRedeemResult: req.redeemResultPda,
+          cvctAccount: fixture.cvctAccountPda,
+          vaultTokenAccount: fixture.vaultTokenAccount,
+          userTokenAccount: fixture.userTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .rpc(TEST_RPC_OPTIONS),
+      "settleRedeemCommit",
+      harness.provider.connection,
+    );
+  });
 }
 
 export async function awaitOperationComputation(
@@ -748,85 +792,204 @@ export async function awaitOperationComputation(
   );
 }
 
+async function pollUntil<T>(
+  fetcher: () => Promise<T>,
+  ready: (value: T) => boolean,
+  describe: (value: T) => string,
+  label: string,
+  intervalMs = 250,
+  timeoutMs = 20_000,
+): Promise<T> {
+  const startedAt = Date.now();
+  let lastValue: T | undefined;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    lastValue = await fetcher();
+    if (ready(lastValue)) {
+      return lastValue;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  const detail = lastValue ? describe(lastValue) : "no state fetched";
+  throw new Error(`${label} timed out after ${timeoutMs}ms: ${detail}`);
+}
+
+export async function waitForPendingDepositCallback(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  resultPda: PublicKey,
+): Promise<{ op: any; result: any }> {
+  return pollUntil(
+    async () => {
+      const [op, result] = await Promise.all([
+        (fixture.harness.program.account as any).pendingOperation.fetch(operationPda),
+        fetchPendingDepositResult(fixture, resultPda),
+      ]);
+      return { op, result };
+    },
+    ({ op, result }) => result.callbackApplied || isTerminalStatus(op.status),
+    ({ op, result }) =>
+      `operation=${operationPda.toBase58()} result=${resultPda.toBase58()} status=${op.status} callback_applied=${result.callbackApplied}`,
+    "waitForPendingDepositCallback",
+  );
+}
+
+export async function waitForPendingRedeemCallback(
+  fixture: Fixture,
+  operationPda: PublicKey,
+  resultPda: PublicKey,
+): Promise<{ op: any; result: any }> {
+  return pollUntil(
+    async () => {
+      const [op, result] = await Promise.all([
+        (fixture.harness.program.account as any).pendingOperation.fetch(operationPda),
+        fetchPendingRedeemResult(fixture, resultPda),
+      ]);
+      return { op, result };
+    },
+    ({ op, result }) => result.callbackApplied || isTerminalStatus(op.status),
+    ({ op, result }) =>
+      `operation=${operationPda.toBase58()} result=${resultPda.toBase58()} status=${op.status} callback_applied=${result.callbackApplied}`,
+    "waitForPendingRedeemCallback",
+  );
+}
+
+export async function waitForPendingTransferCallback(
+  fixture: Fixture,
+  resultPda: PublicKey,
+): Promise<any> {
+  return pollUntil(
+    async () => fetchPendingTransferResult(fixture, resultPda),
+    (result) => result.callbackApplied,
+    (result) =>
+      `result=${resultPda.toBase58()} callback_applied=${result.callbackApplied} ok=${result.ok}`,
+    "waitForPendingTransferCallback",
+  );
+}
+
+export async function requestTransferCvct(
+  fixture: Fixture,
+  amount: number,
+): Promise<RequestResult> {
+  return timed("requestTransferCvct", async () => {
+    const { harness } = fixture;
+    const fromBefore = await harness.program.account.cvctAccount.fetch(
+      fixture.cvctAccountPda,
+    );
+    const toBefore = await harness.program.account.cvctAccount.fetch(
+      fixture.recipientCvctAccountPda,
+    );
+
+  const compOffset = new anchor.BN(randomBytes(8));
+  const computationAccount = getComputationAccAddress(
+    harness.arciumEnv.arciumClusterOffset,
+    compOffset,
+  );
+  const [transferResultPda] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pending_transfer_result"),
+      fixture.cvctAccountPda.toBuffer(),
+      fixture.recipientCvctAccountPda.toBuffer(),
+      computationAccount.toBuffer(),
+    ],
+    harness.program.programId,
+  );
+  const newFromNonce = randomNonce();
+  const newToNonce = randomNonce();
+  const compDefOffset = getCompDefAccOffset(COMP_DEF_TRANSFER);
+
+    await rpcWithLogs(
+      (harness.program.methods as any)
+        .transferCvct(
+          compOffset,
+          new anchor.BN(amount),
+          Array.from(fixture.accountEncPubkey),
+          fromBefore.balanceNonce,
+          newFromNonce.bn,
+          Array.from(fixture.recipientEncPubkey),
+          toBefore.balanceNonce,
+          newToNonce.bn,
+        )
+        .accountsPartial({
+          user: harness.payer.publicKey,
+          fromCvctAccount: fixture.cvctAccountPda,
+          toCvctAccount: fixture.recipientCvctAccountPda,
+          pendingTransferResult: transferResultPda,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          mxeAccount: getMXEAccAddress(harness.program.programId),
+          mempoolAccount: getMempoolAccAddress(harness.arciumEnv.arciumClusterOffset),
+          executingPool: getExecutingPoolAccAddress(harness.arciumEnv.arciumClusterOffset),
+          computationAccount,
+          compDefAccount: getCompDefAccAddress(
+            harness.program.programId,
+            Buffer.from(compDefOffset).readUInt32LE(),
+          ),
+          clusterAccount: getClusterAccAddress(harness.arciumEnv.arciumClusterOffset),
+          poolAccount: harness.poolAccount,
+          clockAccount: harness.clockAccount,
+          arciumProgram: harness.arciumProgramId,
+        })
+        .rpc(TEST_RPC_OPTIONS),
+      "transferCvct",
+      harness.provider.connection,
+    );
+
+    return {
+      operationPda: transferResultPda,
+      transferResultPda,
+      computationOffset: compOffset,
+    };
+  });
+}
+
 export async function transferCvct(
   fixture: Fixture,
   amount: number,
 ): Promise<void> {
   const { harness } = fixture;
-  const fromBefore = await harness.program.account.cvctAccount.fetch(
-    fixture.cvctAccountPda,
-  );
-  const toBefore = await harness.program.account.cvctAccount.fetch(
-    fixture.recipientCvctAccountPda,
-  );
-
-  const compOffset = new anchor.BN(randomBytes(8));
-  const newFromNonce = randomNonce();
-  const newToNonce = randomNonce();
-  const compDefOffset = getCompDefAccOffset(COMP_DEF_TRANSFER);
-
-  await rpcWithLogs(
-    harness.program.methods
-      .transferCvct(
-        compOffset,
-        new anchor.BN(amount),
-        Array.from(fixture.accountEncPubkey),
-        fromBefore.balanceNonce,
-        newFromNonce.bn,
-        Array.from(fixture.recipientEncPubkey),
-        toBefore.balanceNonce,
-        newToNonce.bn,
-      )
-      .accountsPartial({
-        user: harness.payer.publicKey,
-        fromCvctAccount: fixture.cvctAccountPda,
-        toCvctAccount: fixture.recipientCvctAccountPda,
-        systemProgram: anchor.web3.SystemProgram.programId,
-        mxeAccount: getMXEAccAddress(harness.program.programId),
-        mempoolAccount: getMempoolAccAddress(harness.arciumEnv.arciumClusterOffset),
-        executingPool: getExecutingPoolAccAddress(harness.arciumEnv.arciumClusterOffset),
-        computationAccount: getComputationAccAddress(
-          harness.arciumEnv.arciumClusterOffset,
-          compOffset,
-        ),
-        compDefAccount: getCompDefAccAddress(
-          harness.program.programId,
-          Buffer.from(compDefOffset).readUInt32LE(),
-        ),
-        clusterAccount: getClusterAccAddress(harness.arciumEnv.arciumClusterOffset),
-        poolAccount: harness.poolAccount,
-        clockAccount: harness.clockAccount,
-        arciumProgram: harness.arciumProgramId,
-      })
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
-    "transferCvct",
-    harness.provider.connection,
-  );
-
+  const req = await requestTransferCvct(fixture, amount);
   await awaitComputationFinalization(
     harness.provider,
-    compOffset,
+    req.computationOffset,
     harness.program.programId,
     "confirmed",
   );
+  const transferResult = await waitForPendingTransferCallback(
+    fixture,
+    req.transferResultPda!,
+  );
+  expect(transferResult.callbackApplied).to.equal(true);
+  expect(transferResult.ok).to.equal(true);
 
   await waitForUpdatedBalances(
     harness.program,
     fixture.cvctAccountPda,
     fixture.recipientCvctAccountPda,
-    newFromNonce.bn,
-    newToNonce.bn,
+    transferResult.fromBalanceNonce,
+    transferResult.toBalanceNonce,
   );
+}
+
+export async function awaitTransferComputation(
+  fixture: Fixture,
+  req: RequestResult,
+): Promise<any> {
+  return waitForPendingTransferCallback(fixture, req.transferResultPda!);
+}
+
+function isTerminalStatus(status: number): boolean {
+  return status >= 3;
 }
 
 export async function getDecryptedState(fixture: Fixture) {
   const { harness } = fixture;
   const cvctMint = await harness.program.account.cvctMint.fetch(fixture.cvctMintPda);
   const vault = await harness.program.account.vault.fetch(fixture.vaultPda);
-  const cvctAccount = await harness.program.account.cvctAccount.fetch(
+  const cvctAccount = await (harness.program.account as any).cvctAccount.fetch(
     fixture.cvctAccountPda,
   );
-  const recipientCvctAccount = await harness.program.account.cvctAccount.fetch(
+  const recipientCvctAccount = await (harness.program.account as any).cvctAccount.fetch(
     fixture.recipientCvctAccountPda,
   );
 
@@ -860,6 +1023,8 @@ export async function getDecryptedState(fixture: Fixture) {
     decryptedSupply,
     decryptedLocked,
     decryptedRecipientBalance,
+    balanceVersion: Number(cvctAccount.balanceVersion),
+    recipientBalanceVersion: Number(recipientCvctAccount.balanceVersion),
   };
 }
 
@@ -876,7 +1041,7 @@ export async function syncTotalAssetsNoop(fixture: Fixture): Promise<void> {
         vault: fixture.vaultPda,
       })
       .signers([fixture.authoritySigner])
-      .rpc({ skipPreflight: true, commitment: "confirmed" }),
+      .rpc(TEST_RPC_OPTIONS),
     "syncTotalAssets",
     harness.provider.connection,
   );
@@ -911,6 +1076,13 @@ export async function fetchPendingRedeemResult(
   resultPda: PublicKey,
 ): Promise<any> {
   return (fixture.harness.program.account as any).pendingRedeemResult.fetch(resultPda);
+}
+
+export async function fetchPendingTransferResult(
+  fixture: Fixture,
+  resultPda: PublicKey,
+): Promise<any> {
+  return (fixture.harness.program.account as any).pendingTransferResult.fetch(resultPda);
 }
 
 export async function fetchUserBackingBalance(fixture: Fixture): Promise<number> {
@@ -1002,7 +1174,7 @@ export async function settleDepositCall(
       tokenProgram: TOKEN_PROGRAM_ID,
     })
     .signers([fixture.harness.payer.payer])
-    .rpc({ skipPreflight: true, commitment: "confirmed" });
+    .rpc(TEST_RPC_OPTIONS);
 }
 
 export async function cancelDepositIntentCall(
@@ -1019,7 +1191,7 @@ export async function cancelDepositIntentCall(
       pendingDepositResult: depositResultPda,
     })
     .signers([fixture.harness.payer.payer])
-    .rpc({ skipPreflight: true, commitment: "confirmed" });
+    .rpc(TEST_RPC_OPTIONS);
 }
 
 export async function expireDepositIntentCall(
@@ -1035,7 +1207,7 @@ export async function expireDepositIntentCall(
       pendingOperation: operationPda,
       pendingDepositResult: depositResultPda,
     })
-    .rpc({ skipPreflight: true, commitment: "confirmed" });
+    .rpc(TEST_RPC_OPTIONS);
 }
 
 export async function settleRedeemCall(
@@ -1057,7 +1229,7 @@ export async function settleRedeemCall(
       userTokenAccount: fixture.userTokenAccount,
       tokenProgram: TOKEN_PROGRAM_ID,
     })
-    .rpc({ skipPreflight: true, commitment: "confirmed" });
+    .rpc(TEST_RPC_OPTIONS);
 }
 
 async function waitForUpdatedBalances(
@@ -1105,7 +1277,7 @@ async function initMintStateCompDef(
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([payer.payer])
-      .rpc({ commitment: "confirmed" }),
+      .rpc({ commitment: TEST_COMMITMENT }),
     "initMintStateCompDef",
     program.provider.connection,
   );
@@ -1138,7 +1310,7 @@ async function initAccountStateCompDef(
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([payer.payer])
-      .rpc({ commitment: "confirmed" }),
+      .rpc({ commitment: TEST_COMMITMENT }),
     "initAccountStateCompDef",
     program.provider.connection,
   );
@@ -1171,7 +1343,7 @@ async function initDepositAndMintCompDef(
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([payer.payer])
-      .rpc({ commitment: "confirmed" }),
+      .rpc({ commitment: TEST_COMMITMENT }),
     "initDepositAndMintCompDef",
     program.provider.connection,
   );
@@ -1204,7 +1376,7 @@ async function initBurnAndWithdrawCompDef(
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([payer.payer])
-      .rpc({ commitment: "confirmed" }),
+      .rpc({ commitment: TEST_COMMITMENT }),
     "initBurnAndWithdrawCompDef",
     program.provider.connection,
   );
@@ -1237,7 +1409,7 @@ async function initTransferCvctCompDef(
         systemProgram: anchor.web3.SystemProgram.programId,
       })
       .signers([payer.payer])
-      .rpc({ commitment: "confirmed" }),
+      .rpc({ commitment: TEST_COMMITMENT }),
     "initTransferCvctCompDef",
     program.provider.connection,
   );
@@ -1263,7 +1435,7 @@ async function finalizeCompDef(
   finalizeTx.sign(payer.payer);
 
   await rpcWithLogs(
-    program.provider.sendAndConfirm(finalizeTx),
+    program.provider.sendAndConfirm(finalizeTx, [], TEST_SEND_OPTIONS),
     label,
     program.provider.connection,
   );
@@ -1347,8 +1519,47 @@ async function rpcWithLogs<T>(
       }).getLogs(connection);
       console.error(`${label} logs:`, logs);
     }
+    if (err instanceof Error && err.name === "TransactionExpiredTimeoutError") {
+      const signatureMatch = err.message.match(/signature\s+([1-9A-HJ-NP-Za-km-z]+)/);
+      const signature = signatureMatch?.[1];
+      const timeoutError = new Error(
+        [
+          `${label} confirmation timed out after ${TEST_CONFIRM_TIMEOUT_MS}ms.`,
+          signature ? `Signature: ${signature}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(" "),
+      );
+      (timeoutError as Error & { cause?: unknown }).cause = err;
+      throw timeoutError;
+    }
     throw err;
   }
+}
+
+export async function runLabeledRpc<T>(
+  harness: Harness,
+  label: string,
+  rpcCall: () => Promise<T>,
+): Promise<T> {
+  return timed(`rpc:${label}`, async () =>
+    rpcWithLogs(rpcCall(), label, harness.connection),
+  );
+}
+
+export async function sendAndConfirmHarnessTx(
+  harness: Harness,
+  label: string,
+  tx: anchor.web3.Transaction,
+  signers: anchor.web3.Signer[] = [],
+): Promise<string> {
+  return timed(`tx:${label}`, async () =>
+    rpcWithLogs(
+      harness.provider.sendAndConfirm(tx, signers, TEST_SEND_OPTIONS),
+      label,
+      harness.connection,
+    ),
+  );
 }
 
 export async function expectRpcFailure(

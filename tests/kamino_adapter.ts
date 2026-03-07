@@ -11,7 +11,9 @@ import {
   previewRedeemAssets,
   requestDeposit,
   requestRedeem,
+  runLabeledRpc,
   settleRedeemCall,
+  TEST_RPC_OPTIONS,
 } from "./helpers/cvctHarness";
 import {
   assertKaminoArtifactsPresent,
@@ -52,26 +54,28 @@ describe("Cvct Kamino Adapter", () => {
       harness.program.programId,
     );
 
-    await (harness.program.methods as any)
-      .configureKaminoAdapter({
-        kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
-        klendProgram: KAMINO_KLEND_PROGRAM_ID,
-        vaultState,
-        globalConfig: pdas.globalConfig,
-        baseVaultAuthority: pdas.baseVaultAuthority,
-        tokenVault: pdas.tokenVault,
-        sharesMint: pdas.sharesMint,
-        eventAuthority: pdas.eventAuthority,
-        enabled: true,
-      })
-      .accountsPartial({
-        authority: fixture.authoritySigner.publicKey,
-        cvctMint: fixture.cvctMintPda,
-        kaminoAdapter: kaminoAdapterPda,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .signers([fixture.authoritySigner])
-      .rpc({ skipPreflight: true, commitment: "confirmed" });
+    await runLabeledRpc(harness, "configureKaminoAdapter", () =>
+      (harness.program.methods as any)
+        .configureKaminoAdapter({
+          kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
+          klendProgram: KAMINO_KLEND_PROGRAM_ID,
+          vaultState,
+          globalConfig: pdas.globalConfig,
+          baseVaultAuthority: pdas.baseVaultAuthority,
+          tokenVault: pdas.tokenVault,
+          sharesMint: pdas.sharesMint,
+          eventAuthority: pdas.eventAuthority,
+          enabled: true,
+        })
+        .accountsPartial({
+          authority: fixture.authoritySigner.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          kaminoAdapter: kaminoAdapterPda,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([fixture.authoritySigner])
+        .rpc(TEST_RPC_OPTIONS),
+    );
 
     const adapter = await (harness.program.account as any).kaminoAdapterState.fetch(
       kaminoAdapterPda,
@@ -113,7 +117,7 @@ describe("Cvct Kamino Adapter", () => {
           systemProgram: anchor.web3.SystemProgram.programId,
         })
         .signers([fixture.authoritySigner])
-        .rpc({ skipPreflight: true, commitment: "confirmed" }),
+        .rpc(TEST_RPC_OPTIONS),
       "Invalid Kamino adapter configuration or account wiring",
     );
   });
@@ -156,26 +160,28 @@ describe("Cvct Kamino Adapter", () => {
     const kamino = await bootstrapKaminoVault(fixture);
     const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
 
-    await (harness.program.methods as any)
-      .configureKaminoAdapter({
-        kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
-        klendProgram: KAMINO_KLEND_PROGRAM_ID,
-        vaultState: kamino.vaultState.publicKey,
-        globalConfig: kamino.globalConfig,
-        baseVaultAuthority: kamino.baseVaultAuthority,
-        tokenVault: kamino.tokenVault,
-        sharesMint: kamino.sharesMint,
-        eventAuthority: kamino.eventAuthority,
-        enabled: false,
-      })
-      .accountsPartial({
-        authority: fixture.authoritySigner.publicKey,
-        cvctMint: fixture.cvctMintPda,
-        kaminoAdapter: kaminoAdapterPda,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      })
-      .signers([fixture.authoritySigner])
-      .rpc({ skipPreflight: true, commitment: "confirmed" });
+    await runLabeledRpc(harness, "disableKaminoAdapter", () =>
+      (harness.program.methods as any)
+        .configureKaminoAdapter({
+          kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
+          klendProgram: KAMINO_KLEND_PROGRAM_ID,
+          vaultState: kamino.vaultState.publicKey,
+          globalConfig: kamino.globalConfig,
+          baseVaultAuthority: kamino.baseVaultAuthority,
+          tokenVault: kamino.tokenVault,
+          sharesMint: kamino.sharesMint,
+          eventAuthority: kamino.eventAuthority,
+          enabled: false,
+        })
+        .accountsPartial({
+          authority: fixture.authoritySigner.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          kaminoAdapter: kaminoAdapterPda,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .signers([fixture.authoritySigner])
+        .rpc(TEST_RPC_OPTIONS),
+    );
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
@@ -262,7 +268,7 @@ describe("Cvct Kamino Adapter", () => {
           sharesTokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
         })
         .signers([fixture.authoritySigner])
-        .rpc({ skipPreflight: true, commitment: "confirmed" }),
+        .rpc(TEST_RPC_OPTIONS),
       "Invalid Kamino adapter configuration or account wiring",
     );
   });
@@ -279,20 +285,22 @@ describe("Cvct Kamino Adapter", () => {
 
     await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 250_000);
     const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
-    await (harness.program.methods as any)
-      .syncTotalAssetsFromAdapter(
-        Array.from(vaultBefore.totalLocked[0]),
-        vaultBefore.totalLockedNonce,
-      )
-      .accountsPartial({
-        authority: fixture.authoritySigner.publicKey,
-        cvctMint: fixture.cvctMintPda,
-        pricingState: fixture.pricingStatePda,
-        vault: fixture.vaultPda,
-        kaminoAdapter: kaminoAdapterPda,
-      })
-      .signers([fixture.authoritySigner])
-      .rpc({ skipPreflight: true, commitment: "confirmed" });
+    await runLabeledRpc(harness, "syncTotalAssetsFromAdapter", () =>
+      (harness.program.methods as any)
+        .syncTotalAssetsFromAdapter(
+          Array.from(vaultBefore.totalLocked[0]),
+          vaultBefore.totalLockedNonce,
+        )
+        .accountsPartial({
+          authority: fixture.authoritySigner.publicKey,
+          cvctMint: fixture.cvctMintPda,
+          pricingState: fixture.pricingStatePda,
+          vault: fixture.vaultPda,
+          kaminoAdapter: kaminoAdapterPda,
+        })
+        .signers([fixture.authoritySigner])
+        .rpc(TEST_RPC_OPTIONS),
+    );
 
     const state = await getDecryptedState(fixture);
     expect(state.decryptedLocked).to.equal(BigInt(fixture.depositAmount));

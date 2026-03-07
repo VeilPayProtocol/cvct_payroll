@@ -15,7 +15,12 @@ import {
 } from "@solana/web3.js";
 import { existsSync } from "fs";
 import path from "path";
-import { Fixture } from "./cvctHarness";
+import {
+  Fixture,
+  runLabeledRpc,
+  sendAndConfirmHarnessTx,
+  TEST_RPC_OPTIONS,
+} from "./cvctHarness";
 
 export const KAMINO_VAULT_PROGRAM_ID = new PublicKey(
   "KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd",
@@ -232,7 +237,12 @@ async function createVaultSharesTokenAccount(
     ),
   );
 
-  await fixture.harness.provider.sendAndConfirm(tx, [vaultSharesTokenAccount]);
+  await sendAndConfirmHarnessTx(
+    fixture.harness,
+    "createVaultSharesTokenAccount",
+    tx,
+    [vaultSharesTokenAccount],
+  );
   return vaultSharesTokenAccount.publicKey;
 }
 
@@ -282,7 +292,7 @@ export async function bootstrapKaminoVault(
     }),
   );
 
-  await harness.provider.sendAndConfirm(setupTx, [
+  await sendAndConfirmHarnessTx(harness, "bootstrapKaminoVault", setupTx, [
     fixture.authoritySigner,
     vaultState,
   ]);
@@ -313,26 +323,28 @@ export async function configureCvctKaminoAdapter(
     fixture.harness.program.programId,
   );
 
-  await (fixture.harness.program.methods as any)
-    .configureKaminoAdapter({
-      kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
-      klendProgram: KAMINO_KLEND_PROGRAM_ID,
-      vaultState: kamino.vaultState.publicKey,
-      globalConfig: kamino.globalConfig,
-      baseVaultAuthority: kamino.baseVaultAuthority,
-      tokenVault: kamino.tokenVault,
-      sharesMint: kamino.sharesMint,
-      eventAuthority: kamino.eventAuthority,
-      enabled: true,
-    })
-    .accountsPartial({
-      authority: fixture.authoritySigner.publicKey,
-      cvctMint: fixture.cvctMintPda,
-      kaminoAdapter: kaminoAdapterPda,
-      systemProgram: anchor.web3.SystemProgram.programId,
-    })
-    .signers([fixture.authoritySigner])
-    .rpc({ skipPreflight: true, commitment: "confirmed" });
+  await runLabeledRpc(fixture.harness, "configureKaminoAdapter", () =>
+    (fixture.harness.program.methods as any)
+      .configureKaminoAdapter({
+        kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
+        klendProgram: KAMINO_KLEND_PROGRAM_ID,
+        vaultState: kamino.vaultState.publicKey,
+        globalConfig: kamino.globalConfig,
+        baseVaultAuthority: kamino.baseVaultAuthority,
+        tokenVault: kamino.tokenVault,
+        sharesMint: kamino.sharesMint,
+        eventAuthority: kamino.eventAuthority,
+        enabled: true,
+      })
+      .accountsPartial({
+        authority: fixture.authoritySigner.publicKey,
+        cvctMint: fixture.cvctMintPda,
+        kaminoAdapter: kaminoAdapterPda,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      .signers([fixture.authoritySigner])
+      .rpc(TEST_RPC_OPTIONS),
+  );
 
   return kaminoAdapterPda;
 }
@@ -343,28 +355,30 @@ export async function kaminoDepositIdle(
   kamino: KaminoVaultContext,
   amount: number,
 ): Promise<void> {
-  await (fixture.harness.program.methods as any)
-    .kaminoDepositIdle(new anchor.BN(amount))
-    .accountsPartial({
-      authority: fixture.authoritySigner.publicKey,
-      cvctMint: fixture.cvctMintPda,
-      vault: fixture.vaultPda,
-      kaminoAdapter,
-      vaultBackingTokenAccount: fixture.vaultTokenAccount,
-      vaultSharesTokenAccount: kamino.vaultSharesTokenAccount,
-      kaminoVaultState: kamino.vaultState.publicKey,
-      kaminoTokenVault: kamino.tokenVault,
-      kaminoTokenMint: fixture.backingMint,
-      kaminoBaseVaultAuthority: kamino.baseVaultAuthority,
-      kaminoSharesMint: kamino.sharesMint,
-      kaminoEventAuthority: kamino.eventAuthority,
-      kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
-      klendProgram: KAMINO_KLEND_PROGRAM_ID,
-      tokenProgram: TOKEN_PROGRAM_ID,
-      sharesTokenProgram: TOKEN_PROGRAM_ID,
-    })
-    .signers([fixture.authoritySigner])
-    .rpc({ skipPreflight: true, commitment: "confirmed" });
+  await runLabeledRpc(fixture.harness, "kaminoDepositIdle", () =>
+    (fixture.harness.program.methods as any)
+      .kaminoDepositIdle(new anchor.BN(amount))
+      .accountsPartial({
+        authority: fixture.authoritySigner.publicKey,
+        cvctMint: fixture.cvctMintPda,
+        vault: fixture.vaultPda,
+        kaminoAdapter,
+        vaultBackingTokenAccount: fixture.vaultTokenAccount,
+        vaultSharesTokenAccount: kamino.vaultSharesTokenAccount,
+        kaminoVaultState: kamino.vaultState.publicKey,
+        kaminoTokenVault: kamino.tokenVault,
+        kaminoTokenMint: fixture.backingMint,
+        kaminoBaseVaultAuthority: kamino.baseVaultAuthority,
+        kaminoSharesMint: kamino.sharesMint,
+        kaminoEventAuthority: kamino.eventAuthority,
+        kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
+        klendProgram: KAMINO_KLEND_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        sharesTokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([fixture.authoritySigner])
+      .rpc(TEST_RPC_OPTIONS),
+  );
 }
 
 export async function kaminoWithdrawToVault(
@@ -373,29 +387,31 @@ export async function kaminoWithdrawToVault(
   kamino: KaminoVaultContext,
   sharesAmount: number,
 ): Promise<void> {
-  await (fixture.harness.program.methods as any)
-    .kaminoWithdrawToVault(new anchor.BN(sharesAmount))
-    .accountsPartial({
-      authority: fixture.authoritySigner.publicKey,
-      cvctMint: fixture.cvctMintPda,
-      vault: fixture.vaultPda,
-      kaminoAdapter,
-      vaultBackingTokenAccount: fixture.vaultTokenAccount,
-      vaultSharesTokenAccount: kamino.vaultSharesTokenAccount,
-      kaminoVaultState: kamino.vaultState.publicKey,
-      kaminoGlobalConfig: kamino.globalConfig,
-      kaminoTokenVault: kamino.tokenVault,
-      kaminoTokenMint: fixture.backingMint,
-      kaminoBaseVaultAuthority: kamino.baseVaultAuthority,
-      kaminoSharesMint: kamino.sharesMint,
-      kaminoEventAuthority: kamino.eventAuthority,
-      kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
-      klendProgram: KAMINO_KLEND_PROGRAM_ID,
-      tokenProgram: TOKEN_PROGRAM_ID,
-      sharesTokenProgram: TOKEN_PROGRAM_ID,
-    })
-    .signers([fixture.authoritySigner])
-    .rpc({ skipPreflight: true, commitment: "confirmed" });
+  await runLabeledRpc(fixture.harness, "kaminoWithdrawToVault", () =>
+    (fixture.harness.program.methods as any)
+      .kaminoWithdrawToVault(new anchor.BN(sharesAmount))
+      .accountsPartial({
+        authority: fixture.authoritySigner.publicKey,
+        cvctMint: fixture.cvctMintPda,
+        vault: fixture.vaultPda,
+        kaminoAdapter,
+        vaultBackingTokenAccount: fixture.vaultTokenAccount,
+        vaultSharesTokenAccount: kamino.vaultSharesTokenAccount,
+        kaminoVaultState: kamino.vaultState.publicKey,
+        kaminoGlobalConfig: kamino.globalConfig,
+        kaminoTokenVault: kamino.tokenVault,
+        kaminoTokenMint: fixture.backingMint,
+        kaminoBaseVaultAuthority: kamino.baseVaultAuthority,
+        kaminoSharesMint: kamino.sharesMint,
+        kaminoEventAuthority: kamino.eventAuthority,
+        kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
+        klendProgram: KAMINO_KLEND_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        sharesTokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([fixture.authoritySigner])
+      .rpc(TEST_RPC_OPTIONS),
+  );
 }
 
 export async function vaultBackedTokenAmount(fixture: Fixture): Promise<number> {
