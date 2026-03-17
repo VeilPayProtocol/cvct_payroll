@@ -2,14 +2,18 @@
 
 ## Overview
 
-CVCT is a confidential vault-backed token protocol for Solana.
+CVCT is a private yield treasury protocol for Solana.
 
-It separates three concerns:
+The current implementation uses a confidential, vault-backed share ledger to support that product direction. It separates three concerns:
 - `Custody`: real SPL assets live in vault-controlled token accounts on Solana
 - `Accounting`: balances and global totals are encrypted and updated through Arcium MPC
 - `Settlement`: canonical confidential state only commits when the corresponding custody step succeeds
 
 That separation is the core architectural decision in this codebase.
+
+The important framing is:
+- the product is private treasury and private balance management with yield
+- MPC is the accounting/privacy layer, not the product itself
 
 ## Design principles
 
@@ -29,17 +33,17 @@ Operation-purpose PDAs remain inspectable after terminal completion and can then
 
 ```mermaid
 flowchart LR
-    User["User"] --> Program["CVCT Anchor program"]
+    User["User / Treasury operator"] --> Program["CVCT Anchor program"]
     Program --> Arcium["Arcium MPC"]
     Program --> Vault["Vault custody (SPL tokens)"]
-    Program --> State["Encrypted state accounts"]
-    Program --> Kamino["Kamino adapter (manual treasury)"]
+    Program --> State["Encrypted balance and total state"]
+    Program --> Kamino["Kamino adapter (manual yield deployment)"]
 ```
 
 ## Main accounts
 
 ### `CvctMint`
-Confidential mint metadata.
+Confidential share-ledger metadata.
 
 Holds:
 - backing SPL mint reference
@@ -47,7 +51,7 @@ Holds:
 - nonce for encrypted supply
 
 ### `Vault`
-Confidential asset backing metadata.
+Confidential treasury asset metadata.
 
 Holds:
 - backing SPL mint
@@ -56,7 +60,7 @@ Holds:
 - nonce for encrypted locked assets
 
 ### `PricingState`
-Global optimistic concurrency guard for price-sensitive operations.
+Global optimistic concurrency guard for price-sensitive treasury operations.
 
 Holds:
 - `cvct_mint`
@@ -71,7 +75,7 @@ Holds:
 No-op sync does not increment it.
 
 ### `CvctAccount`
-Per-user confidential account.
+Per-user confidential balance account.
 
 Holds:
 - owner
@@ -80,7 +84,7 @@ Holds:
 - nonce for encrypted balance
 - `balance_version`
 
-`balance_version` is the per-account concurrency guard used to prevent transfers or staged operations from overwriting newer user balance state.
+`balance_version` is the per-account concurrency guard used to prevent transfers or staged operations from overwriting newer balance state.
 
 ### `PendingOperation`
 Shared request lifecycle account for deposit and redeem.
@@ -121,7 +125,7 @@ Holds:
 - base sender/recipient balance versions
 
 ### `KaminoAdapterState`
-Manual treasury adapter configuration.
+Manual yield adapter configuration.
 
 Holds:
 - mint reference
@@ -129,7 +133,7 @@ Holds:
 - KLend program reference
 - enable/disable flag
 
-The adapter is Kamino-specific. The code now treats Kamino program identity as pinned, not operator-configurable.
+The adapter is Kamino-specific. The code treats Kamino program identity as pinned, not operator-configurable.
 
 ## Deposit architecture
 
@@ -156,6 +160,8 @@ The current deposit path avoids that:
 - request records intent only
 - callback stages output only
 - settlement commits custody and accounting together
+
+In product terms, deposit is a treasury funding flow into private internal balances.
 
 ## Redeem architecture
 
@@ -184,6 +190,8 @@ In that case:
 - treasury can withdraw liquidity from Kamino
 - settlement can be retried safely
 
+In product terms, redeem is a private internal balance being converted back into spendable assets without forcing treasury deployment into the same hot path.
+
 ## Transfer architecture
 
 Transfer stays simpler than deposit and redeem:
@@ -195,6 +203,8 @@ Failed transfers:
 - record `ok = false` in `PendingTransferResult`
 - do not mutate canonical balances
 - do not bump `balance_version`
+
+This is the primitive that makes private desk allocation, contributor balances, grant balances, or payroll balances workable without exposing them on-chain.
 
 ## Concurrency model
 
@@ -252,18 +262,21 @@ Conceptually:
 
 The circuit verifies the caller/backend quote against the confidential state rather than trusting it blindly.
 
+This matters because CVCT should behave like a private yield-bearing treasury ledger, where the exchange rate between shares and assets is part of the system's economic truth.
+
 ## What the architecture is optimized for
 
-- privacy of user balances and supply movements
+- privacy of internal balances and aggregate treasury state
 - deterministic settlement semantics
 - safe invalidation of stale work
-- explicit treasury management
+- explicit yield deployment and treasury management
 - testable, decomposed lifecycle behavior
 
 ## What it does not optimize for yet
 
 - minimum-UX public APIs (`min_out`-only user surface is still future work)
 - automatic treasury rebalancing
+- shielded in / shielded out cash movement
 - minimal local integration runtime
 
 Those are follow-on concerns. The current codebase prioritizes correctness and observability.
