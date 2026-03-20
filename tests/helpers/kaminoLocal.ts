@@ -337,6 +337,25 @@ export async function configureCvctKaminoAdapter(
   return kaminoAdapterPda;
 }
 
+export async function updateKaminoPolicy(
+  fixture: Fixture,
+  kaminoAdapter: PublicKey,
+  thresholdBps: number,
+  redeemWithdrawBufferAmount = 0,
+): Promise<void> {
+  await runLabeledRpc(fixture.harness, "updateKaminoPolicy", () =>
+    (fixture.harness.program.methods as any)
+      .updateKaminoPolicy(thresholdBps, new anchor.BN(redeemWithdrawBufferAmount))
+      .accountsPartial({
+        authority: fixture.authoritySigner.publicKey,
+        cvctMint: fixture.cvctMintPda,
+        kaminoAdapter,
+      })
+      .signers([fixture.authoritySigner])
+      .rpc(TEST_RPC_OPTIONS),
+  );
+}
+
 export async function kaminoDepositIdle(
   fixture: Fixture,
   kaminoAdapter: PublicKey,
@@ -346,6 +365,37 @@ export async function kaminoDepositIdle(
   await runLabeledRpc(fixture.harness, "kaminoDepositIdle", () =>
     (fixture.harness.program.methods as any)
       .kaminoDepositIdle(new anchor.BN(amount))
+      .accountsPartial({
+        authority: fixture.authoritySigner.publicKey,
+        cvctMint: fixture.cvctMintPda,
+        vault: fixture.vaultPda,
+        kaminoAdapter,
+        vaultBackingTokenAccount: fixture.vaultTokenAccount,
+        vaultSharesTokenAccount: kamino.vaultSharesTokenAccount,
+        kaminoVaultState: kamino.vaultState.publicKey,
+        kaminoTokenVault: kamino.tokenVault,
+        kaminoTokenMint: fixture.backingMint,
+        kaminoBaseVaultAuthority: kamino.baseVaultAuthority,
+        kaminoSharesMint: kamino.sharesMint,
+        kaminoEventAuthority: kamino.eventAuthority,
+        kaminoProgram: KAMINO_VAULT_PROGRAM_ID,
+        klendProgram: KAMINO_KLEND_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        sharesTokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([fixture.authoritySigner])
+      .rpc(TEST_RPC_OPTIONS),
+  );
+}
+
+export async function rebalanceIdleLiquidity(
+  fixture: Fixture,
+  kaminoAdapter: PublicKey,
+  kamino: KaminoVaultContext,
+): Promise<void> {
+  await runLabeledRpc(fixture.harness, "rebalanceIdleLiquidity", () =>
+    (fixture.harness.program.methods as any)
+      .rebalanceIdleLiquidity()
       .accountsPartial({
         authority: fixture.authoritySigner.publicKey,
         cvctMint: fixture.cvctMintPda,
@@ -416,4 +466,25 @@ export async function vaultSharesTokenAmount(
 ): Promise<number> {
   const account = await getAccount(connection, kamino.vaultSharesTokenAccount);
   return Number(account.amount);
+}
+
+export function kaminoRedeemRemainingAccounts(
+  kaminoAdapter: PublicKey,
+  fixture: Fixture,
+  kamino: KaminoVaultContext,
+): anchor.web3.AccountMeta[] {
+  return [
+    { pubkey: kaminoAdapter, isSigner: false, isWritable: false },
+    { pubkey: kamino.vaultSharesTokenAccount, isSigner: false, isWritable: true },
+    { pubkey: kamino.vaultState.publicKey, isSigner: false, isWritable: true },
+    { pubkey: kamino.globalConfig, isSigner: false, isWritable: false },
+    { pubkey: kamino.tokenVault, isSigner: false, isWritable: true },
+    { pubkey: fixture.backingMint, isSigner: false, isWritable: true },
+    { pubkey: kamino.baseVaultAuthority, isSigner: false, isWritable: false },
+    { pubkey: kamino.sharesMint, isSigner: false, isWritable: true },
+    { pubkey: kamino.eventAuthority, isSigner: false, isWritable: false },
+    { pubkey: KAMINO_VAULT_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: KAMINO_KLEND_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+  ];
 }

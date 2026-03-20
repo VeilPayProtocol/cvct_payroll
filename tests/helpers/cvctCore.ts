@@ -1355,9 +1355,15 @@ export async function expireDepositIntentCall(
 export async function settleRedeemCall(
   fixture: Fixture,
   operationPda: PublicKey,
-  redeemResultPda?: PublicKey
+  redeemResultPda?: PublicKey,
+  remainingAccounts?: anchor.web3.AccountMeta[]
 ): Promise<unknown> {
-  return buildSettleRedeemTx(fixture, operationPda, redeemResultPda).rpc(
+  return buildSettleRedeemTx(
+    fixture,
+    operationPda,
+    redeemResultPda,
+    remainingAccounts
+  ).rpc(
     TEST_RPC_OPTIONS
   );
 }
@@ -1365,9 +1371,10 @@ export async function settleRedeemCall(
 function buildSettleRedeemTx(
   fixture: Fixture,
   operationPda: PublicKey,
-  redeemResultPda?: PublicKey
+  redeemResultPda?: PublicKey,
+  remainingAccounts?: anchor.web3.AccountMeta[]
 ) {
-  return (fixture.harness.program.methods as any)
+  const builder = (fixture.harness.program.methods as any)
     .settleRedeemCommit()
     .accountsPartial({
       executor: fixture.harness.payer.publicKey,
@@ -1381,6 +1388,7 @@ function buildSettleRedeemTx(
       userTokenAccount: fixture.userTokenAccount,
       tokenProgram: TOKEN_PROGRAM_ID,
     });
+  return remainingAccounts ? builder.remainingAccounts(remainingAccounts) : builder;
 }
 
 export async function cleanupTerminalDepositCall(

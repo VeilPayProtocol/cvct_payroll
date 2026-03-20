@@ -17,6 +17,7 @@ const COMP_DEF_OFFSET_BURN_AND_WITHDRAW: u32 = comp_def_offset("burn_and_withdra
 const COMP_DEF_OFFSET_TRANSFER_CVCT: u32 = comp_def_offset("transfer_cvct");
 const ENCRYPTED_U128_CIPHERTEXTS: usize = 1;
 const MAX_SAFE_OPERAND_U64: u64 = u64::MAX - 1;
+const MAX_BPS: u16 = 10_000;
 const KAMINO_VAULT_ID: Pubkey = pubkey!("KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd");
 const KAMINO_BASE_VAULT_AUTHORITY_SEED: &[u8] = b"authority";
 const KAMINO_TOKEN_VAULT_SEED: &[u8] = b"token_vault";
@@ -955,8 +956,10 @@ pub mod cvct {
         Ok(())
     }
 
-    pub fn settle_redeem_commit(ctx: Context<SettleRedeemCommit>) -> Result<()> {
-        let pending_op = &mut ctx.accounts.pending_operation;
+    pub fn settle_redeem_commit<'info>(
+        ctx: Context<'_, '_, 'info, 'info, SettleRedeemCommit<'info>>,
+    ) -> Result<()> {
+        let pending_op = &ctx.accounts.pending_operation;
         if is_terminal_status(pending_op.status) {
             return Ok(());
         }
@@ -970,7 +973,7 @@ pub mod cvct {
                 || pending_op.status == STATUS_COMPUTED_FAILURE,
             ErrorCode::InvalidOperationPhase
         );
-        let pending_result = &mut ctx.accounts.pending_redeem_result;
+        let pending_result = &ctx.accounts.pending_redeem_result;
         require!(
             pending_result.operation_id == pending_op.operation_id,
             ErrorCode::InvalidPendingOperation
@@ -1004,6 +1007,8 @@ pub mod cvct {
             || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
             || ctx.accounts.cvct_account.balance_version != pending_result.base_user_balance_version
         {
+            let pending_op = &mut ctx.accounts.pending_operation;
+            let pending_result = &mut ctx.accounts.pending_redeem_result;
             pending_op.status = STATUS_INVALIDATED;
             pending_op.ok = false;
             pending_op.amount_out = 0;
@@ -1018,6 +1023,7 @@ pub mod cvct {
             return Ok(());
         }
         if !pending_op.ok {
+            let pending_op = &mut ctx.accounts.pending_operation;
             pending_op.status = OperationStatus::Failed as u8;
             emit!(OperationSettledEvent {
                 operation_id: pending_op.operation_id,
@@ -1028,8 +1034,129 @@ pub mod cvct {
             return Ok(());
         }
 
+        let amount_out = pending_op.amount_out;
+        let operation_id = pending_op.operation_id;
+        let idle_before = ctx.accounts.vault_token_account.amount;
+        if idle_before < amount_out {
+            let deficit = amount_out
+                .checked_sub(idle_before)
+                .ok_or(ErrorCode::InvalidAmount)?;
+            let remaining = ctx.remaining_accounts;
+            require!(
+                remaining.len() >= 12,
+                ErrorCode::MissingKaminoAccountsForRedeem
+            );
+
+            let kamino_adapter = Account::<KaminoAdapterState>::try_from(&remaining[0])?;
+            require!(
+                kamino_adapter.cvct_mint == ctx.accounts.cvct_mint.key(),
+                ErrorCode::InvalidKaminoAdapterConfig
+            );
+            require!(kamino_adapter.enabled, ErrorCode::KaminoAdapterDisabled);
+
+            let vault_shares_token_account = Account::<TokenAccount>::try_from(&remaining[1])?;
+            require!(
+                vault_shares_token_account.owner == ctx.accounts.vault.key(),
+                ErrorCode::InvalidKaminoAdapterConfig
+            );
+            require!(
+                vault_shares_token_account.mint == kamino_adapter.shares_mint,
+                ErrorCode::InvalidKaminoAdapterConfig
+            );
+
+            let kamino_vault_state = &remaining[2];
+            let kamino_global_config = &remaining[3];
+            let kamino_token_vault = Account::<TokenAccount>::try_from(&remaining[4])?;
+            let kamino_token_mint = &remaining[5];
+            let kamino_base_vault_authority = &remaining[6];
+            let kamino_shares_mint = &remaining[7];
+            let kamino_event_authority = &remaining[8];
+            let kamino_program = &remaining[9];
+            let klend_program = &remaining[10];
+            let shares_token_program = &remaining[11];
+
+            require!(
+                kamino_vault_state.key() == kamino_adapter.vault_state
+                    && kamino_global_config.key() == kamino_adapter.global_config
+                    && kamino_token_vault.key() == kamino_adapter.token_vault
+                    && kamino_token_mint.key() == ctx.accounts.cvct_mint.backing_mint
+                    && kamino_base_vault_authority.key() == kamino_adapter.base_vault_authority
+                    && kamino_shares_mint.key() == kamino_adapter.shares_mint
+                    && kamino_event_authority.key() == kamino_adapter.event_authority
+                    && kamino_program.key() == KAMINO_VAULT_ID
+                    && klend_program.key() == kamino_adapter.klend_program
+                    && shares_token_program.key() == anchor_spl::token::ID,
+                ErrorCode::InvalidKaminoAdapterConfig
+            );
+
+            let liquidity = read_kamino_liquidity_state(
+                kamino_vault_state,
+                &kamino_token_vault,
+                &vault_shares_token_account,
+            )?;
+            require!(
+                liquidity.cvct_available_liquidity >= deficit,
+                ErrorCode::InsufficientIdleLiquidity
+            );
+
+            let target_pull_assets = deficit
+                .checked_add(kamino_adapter.redeem_withdraw_buffer_amount)
+                .ok_or(ErrorCode::InvalidAmount)?
+                .min(liquidity.cvct_available_liquidity);
+            require!(
+                target_pull_assets >= deficit,
+                ErrorCode::InsufficientIdleLiquidity
+            );
+
+            let shares_burned: u64 = ceil_div_u128(
+                (target_pull_assets as u128)
+                    .checked_mul(liquidity.shares_issued as u128)
+                    .ok_or(ErrorCode::InvalidAmount)?,
+                liquidity.available_total as u128,
+            )?
+            .try_into()
+            .map_err(|_| ErrorCode::InvalidAmount)?;
+            require!(
+                shares_burned > 0 && shares_burned <= vault_shares_token_account.amount,
+                ErrorCode::InsufficientIdleLiquidity
+            );
+
+            invoke_kamino_withdraw(
+                ctx.accounts.cvct_mint.key(),
+                ctx.accounts.vault.to_account_info(),
+                kamino_vault_state.clone(),
+                kamino_global_config.clone(),
+                kamino_token_vault.to_account_info(),
+                kamino_base_vault_authority.clone(),
+                ctx.accounts.vault_token_account.to_account_info(),
+                kamino_token_mint.clone(),
+                vault_shares_token_account.to_account_info(),
+                kamino_shares_mint.clone(),
+                ctx.accounts.token_program.to_account_info(),
+                shares_token_program.clone(),
+                klend_program.clone(),
+                kamino_event_authority.clone(),
+                kamino_program.clone(),
+                ctx.bumps.vault,
+                shares_burned,
+            )?;
+            ctx.accounts.vault_token_account.reload()?;
+            emit!(RedeemLiquidityPulledEvent {
+                cvct_mint: ctx.accounts.cvct_mint.key(),
+                operation_id,
+                idle_before,
+                idle_after: ctx.accounts.vault_token_account.amount,
+                assets_requested: amount_out,
+                target_pull_assets,
+                assets_pulled: ctx.accounts
+                    .vault_token_account
+                    .amount
+                    .saturating_sub(idle_before),
+                shares_burned,
+            });
+        }
         require!(
-            ctx.accounts.vault_token_account.amount >= pending_op.amount_out,
+            ctx.accounts.vault_token_account.amount >= amount_out,
             ErrorCode::InsufficientIdleLiquidity
         );
 
@@ -1051,12 +1178,14 @@ pub mod cvct {
                 },
                 signer_seeds,
             ),
-            pending_op.amount_out,
+            amount_out,
         )?;
 
         let cvct_account = &mut ctx.accounts.cvct_account;
         let cvct_mint = &mut ctx.accounts.cvct_mint;
         let vault = &mut ctx.accounts.vault;
+        let pending_op = &mut ctx.accounts.pending_operation;
+        let pending_result = &ctx.accounts.pending_redeem_result;
 
         cvct_account.balance = pending_result.balance;
         cvct_account.balance_nonce = pending_result.balance_nonce;
@@ -1147,44 +1276,66 @@ pub mod cvct {
         Ok(())
     }
 
+    pub fn update_kamino_policy(
+        ctx: Context<UpdateKaminoPolicy>,
+        idle_liquidity_threshold_bps: u16,
+        redeem_withdraw_buffer_amount: u64,
+    ) -> Result<()> {
+        require!(
+            idle_liquidity_threshold_bps <= MAX_BPS,
+            ErrorCode::InvalidKaminoPolicy
+        );
+        let adapter = &mut ctx.accounts.kamino_adapter;
+        adapter.idle_liquidity_threshold_bps = idle_liquidity_threshold_bps;
+        adapter.redeem_withdraw_buffer_amount = redeem_withdraw_buffer_amount;
+        emit!(KaminoPolicyUpdatedEvent {
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            threshold_bps: idle_liquidity_threshold_bps,
+            redeem_withdraw_buffer_amount,
+        });
+        Ok(())
+    }
+
     pub fn kamino_deposit_idle(ctx: Context<KaminoDepositIdle>, amount: u64) -> Result<()> {
         require!(amount > 0, ErrorCode::ZeroAmount);
+        invoke_kamino_deposit(
+            ctx.accounts.cvct_mint.key(),
+            ctx.accounts.vault.to_account_info(),
+            ctx.accounts.kamino_vault_state.to_account_info(),
+            ctx.accounts.kamino_token_vault.to_account_info(),
+            ctx.accounts.kamino_token_mint.to_account_info(),
+            ctx.accounts.kamino_base_vault_authority.to_account_info(),
+            ctx.accounts.kamino_shares_mint.to_account_info(),
+            ctx.accounts.vault_backing_token_account.to_account_info(),
+            ctx.accounts.vault_shares_token_account.to_account_info(),
+            ctx.accounts.klend_program.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.shares_token_program.to_account_info(),
+            ctx.accounts.kamino_event_authority.to_account_info(),
+            ctx.accounts.kamino_program.to_account_info(),
+            ctx.bumps.vault,
+            amount,
+        )?;
+        Ok(())
+    }
 
-        let cvct_mint_key = ctx.accounts.cvct_mint.key();
-        let vault_seeds = &[
-            b"vault".as_ref(),
-            cvct_mint_key.as_ref(),
-            &[ctx.bumps.vault],
-        ];
-        let signer_seeds = &[&vault_seeds[..]];
+    pub fn rebalance_idle_liquidity(ctx: Context<RebalanceIdleLiquidity>) -> Result<()> {
+        let threshold_bps = ctx.accounts.kamino_adapter.idle_liquidity_threshold_bps;
+        let kamino_state = read_kamino_liquidity_state(
+            &ctx.accounts.kamino_vault_state.to_account_info(),
+            &ctx.accounts.kamino_token_vault,
+            &ctx.accounts.vault_shares_token_account,
+        )?;
+        let idle_before = ctx.accounts.vault_backing_token_account.amount;
+        let liquid_total = idle_before
+            .checked_add(kamino_state.cvct_available_liquidity)
+            .ok_or(ErrorCode::InvalidAmount)?;
+        let target_idle = compute_threshold_amount(liquid_total, threshold_bps)?;
+        let deposit_amount = idle_before.saturating_sub(target_idle);
 
-        let ix_data = kamino_vault::instruction::Deposit {
-            _max_amount: amount,
-        }
-        .data();
-        let ix = Instruction {
-            program_id: ctx.accounts.kamino_program.key(),
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.vault.key(), true),
-                AccountMeta::new(ctx.accounts.kamino_vault_state.key(), false),
-                AccountMeta::new(ctx.accounts.kamino_token_vault.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.kamino_token_mint.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.kamino_base_vault_authority.key(), false),
-                AccountMeta::new(ctx.accounts.kamino_shares_mint.key(), false),
-                AccountMeta::new(ctx.accounts.vault_backing_token_account.key(), false),
-                AccountMeta::new(ctx.accounts.vault_shares_token_account.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.klend_program.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.shares_token_program.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.kamino_event_authority.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.kamino_program.key(), false),
-            ],
-            data: ix_data,
-        };
-
-        invoke_signed(
-            &ix,
-            &[
+        if deposit_amount > 0 {
+            invoke_kamino_deposit(
+                ctx.accounts.cvct_mint.key(),
                 ctx.accounts.vault.to_account_info(),
                 ctx.accounts.kamino_vault_state.to_account_info(),
                 ctx.accounts.kamino_token_vault.to_account_info(),
@@ -1198,10 +1349,21 @@ pub mod cvct {
                 ctx.accounts.shares_token_program.to_account_info(),
                 ctx.accounts.kamino_event_authority.to_account_info(),
                 ctx.accounts.kamino_program.to_account_info(),
-            ],
-            signer_seeds,
-        )?;
+                ctx.bumps.vault,
+                deposit_amount,
+            )?;
+            ctx.accounts.vault_backing_token_account.reload()?;
+        }
 
+        emit!(TreasuryRebalancedEvent {
+            cvct_mint: ctx.accounts.cvct_mint.key(),
+            threshold_bps,
+            liquid_total,
+            idle_before,
+            target_idle,
+            deposited_to_kamino: deposit_amount,
+            idle_after: ctx.accounts.vault_backing_token_account.amount,
+        });
         Ok(())
     }
 
@@ -1210,61 +1372,25 @@ pub mod cvct {
         shares_amount: u64,
     ) -> Result<()> {
         require!(shares_amount > 0, ErrorCode::ZeroAmount);
-
-        let cvct_mint_key = ctx.accounts.cvct_mint.key();
-        let vault_seeds = &[
-            b"vault".as_ref(),
-            cvct_mint_key.as_ref(),
-            &[ctx.bumps.vault],
-        ];
-        let signer_seeds = &[&vault_seeds[..]];
-
-        let ix_data = kamino_vault::instruction::WithdrawFromAvailable {
-            _shares_amount: shares_amount,
-        }
-        .data();
-        let ix = Instruction {
-            program_id: ctx.accounts.kamino_program.key(),
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.vault.key(), true),
-                AccountMeta::new(ctx.accounts.kamino_vault_state.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.kamino_global_config.key(), false),
-                AccountMeta::new(ctx.accounts.kamino_token_vault.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.kamino_base_vault_authority.key(), false),
-                AccountMeta::new(ctx.accounts.vault_backing_token_account.key(), false),
-                AccountMeta::new(ctx.accounts.kamino_token_mint.key(), false),
-                AccountMeta::new(ctx.accounts.vault_shares_token_account.key(), false),
-                AccountMeta::new(ctx.accounts.kamino_shares_mint.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.shares_token_program.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.klend_program.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.kamino_event_authority.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.kamino_program.key(), false),
-            ],
-            data: ix_data,
-        };
-
-        invoke_signed(
-            &ix,
-            &[
-                ctx.accounts.vault.to_account_info(),
-                ctx.accounts.kamino_vault_state.to_account_info(),
-                ctx.accounts.kamino_global_config.to_account_info(),
-                ctx.accounts.kamino_token_vault.to_account_info(),
-                ctx.accounts.kamino_base_vault_authority.to_account_info(),
-                ctx.accounts.vault_backing_token_account.to_account_info(),
-                ctx.accounts.kamino_token_mint.to_account_info(),
-                ctx.accounts.vault_shares_token_account.to_account_info(),
-                ctx.accounts.kamino_shares_mint.to_account_info(),
-                ctx.accounts.token_program.to_account_info(),
-                ctx.accounts.shares_token_program.to_account_info(),
-                ctx.accounts.klend_program.to_account_info(),
-                ctx.accounts.kamino_event_authority.to_account_info(),
-                ctx.accounts.kamino_program.to_account_info(),
-            ],
-            signer_seeds,
+        invoke_kamino_withdraw(
+            ctx.accounts.cvct_mint.key(),
+            ctx.accounts.vault.to_account_info(),
+            ctx.accounts.kamino_vault_state.to_account_info(),
+            ctx.accounts.kamino_global_config.to_account_info(),
+            ctx.accounts.kamino_token_vault.to_account_info(),
+            ctx.accounts.kamino_base_vault_authority.to_account_info(),
+            ctx.accounts.vault_backing_token_account.to_account_info(),
+            ctx.accounts.kamino_token_mint.to_account_info(),
+            ctx.accounts.vault_shares_token_account.to_account_info(),
+            ctx.accounts.kamino_shares_mint.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.shares_token_program.to_account_info(),
+            ctx.accounts.klend_program.to_account_info(),
+            ctx.accounts.kamino_event_authority.to_account_info(),
+            ctx.accounts.kamino_program.to_account_info(),
+            ctx.bumps.vault,
+            shares_amount,
         )?;
-
         Ok(())
     }
 
@@ -1702,10 +1828,235 @@ pub struct KaminoAdapterState {
     pub shares_mint: Pubkey,
     pub event_authority: Pubkey,
     pub enabled: bool,
+    pub idle_liquidity_threshold_bps: u16,
+    pub redeem_withdraw_buffer_amount: u64,
 }
 
 impl KaminoAdapterState {
-    pub const LEN: usize = (32 * 8) + 1;
+    pub const LEN: usize = (32 * 8) + 1 + 2 + 8;
+}
+
+#[allow(dead_code)]
+#[derive(AnchorDeserialize, Clone, Copy)]
+struct KaminoVaultLiquiditySnapshot {
+    pub vault_admin_authority: Pubkey,
+    pub base_vault_authority: Pubkey,
+    pub base_vault_authority_bump: u64,
+    pub token_mint: Pubkey,
+    pub token_mint_decimals: u64,
+    pub token_vault: Pubkey,
+    pub token_program: Pubkey,
+    pub shares_mint: Pubkey,
+    pub shares_mint_decimals: u64,
+    pub token_available: u64,
+    pub shares_issued: u64,
+}
+
+struct KaminoLiquidityState {
+    available_total: u64,
+    cvct_available_liquidity: u64,
+    shares_issued: u64,
+}
+
+fn ceil_div_u128(numerator: u128, denominator: u128) -> Result<u128> {
+    require!(denominator > 0, ErrorCode::InvalidKaminoLiquidityState);
+    let adjusted = numerator
+        .checked_add(denominator - 1)
+        .ok_or(ErrorCode::InvalidAmount)?;
+    Ok(adjusted / denominator)
+}
+
+fn compute_threshold_amount(liquid_total: u64, threshold_bps: u16) -> Result<u64> {
+    let scaled = (liquid_total as u128)
+        .checked_mul(threshold_bps as u128)
+        .ok_or(ErrorCode::InvalidAmount)?;
+    Ok((scaled / MAX_BPS as u128)
+        .try_into()
+        .map_err(|_| ErrorCode::InvalidAmount)?)
+}
+
+fn read_kamino_vault_liquidity_snapshot(
+    kamino_vault_state: &AccountInfo,
+) -> Result<KaminoVaultLiquiditySnapshot> {
+    require!(
+        kamino_vault_state.owner == &KAMINO_VAULT_ID,
+        ErrorCode::InvalidKaminoAdapterConfig
+    );
+    let data = kamino_vault_state.try_borrow_data()?;
+    require!(data.len() > 8, ErrorCode::InvalidKaminoLiquidityState);
+    let mut payload: &[u8] = &data[8..];
+    KaminoVaultLiquiditySnapshot::deserialize(&mut payload)
+        .map_err(|_| error!(ErrorCode::InvalidKaminoLiquidityState))
+}
+
+fn read_kamino_liquidity_state(
+    kamino_vault_state: &AccountInfo,
+    kamino_token_vault: &Account<TokenAccount>,
+    vault_shares_token_account: &Account<TokenAccount>,
+) -> Result<KaminoLiquidityState> {
+    if vault_shares_token_account.amount == 0 {
+        return Ok(KaminoLiquidityState {
+            available_total: 0,
+            cvct_available_liquidity: 0,
+            shares_issued: 0,
+        });
+    }
+
+    let snapshot = read_kamino_vault_liquidity_snapshot(kamino_vault_state)?;
+    let available_total = snapshot.token_available.min(kamino_token_vault.amount);
+    require!(snapshot.shares_issued > 0, ErrorCode::InvalidKaminoLiquidityState);
+
+    let cvct_available_liquidity = ((available_total as u128)
+        .checked_mul(vault_shares_token_account.amount as u128)
+        .ok_or(ErrorCode::InvalidAmount)?
+        / snapshot.shares_issued as u128)
+        .try_into()
+        .map_err(|_| ErrorCode::InvalidAmount)?;
+
+    Ok(KaminoLiquidityState {
+        available_total,
+        cvct_available_liquidity,
+        shares_issued: snapshot.shares_issued,
+    })
+}
+
+fn invoke_kamino_deposit<'info>(
+    cvct_mint_key: Pubkey,
+    vault: AccountInfo<'info>,
+    kamino_vault_state: AccountInfo<'info>,
+    kamino_token_vault: AccountInfo<'info>,
+    kamino_token_mint: AccountInfo<'info>,
+    kamino_base_vault_authority: AccountInfo<'info>,
+    kamino_shares_mint: AccountInfo<'info>,
+    vault_backing_token_account: AccountInfo<'info>,
+    vault_shares_token_account: AccountInfo<'info>,
+    klend_program: AccountInfo<'info>,
+    token_program: AccountInfo<'info>,
+    shares_token_program: AccountInfo<'info>,
+    kamino_event_authority: AccountInfo<'info>,
+    kamino_program: AccountInfo<'info>,
+    vault_bump: u8,
+    amount: u64,
+) -> Result<()> {
+    let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[vault_bump]];
+    let signer_seeds = &[&vault_seeds[..]];
+
+    let ix_data = kamino_vault::instruction::Deposit {
+        _max_amount: amount,
+    }
+    .data();
+    let ix = Instruction {
+        program_id: kamino_program.key(),
+        accounts: vec![
+            AccountMeta::new(vault.key(), true),
+            AccountMeta::new(kamino_vault_state.key(), false),
+            AccountMeta::new(kamino_token_vault.key(), false),
+            AccountMeta::new_readonly(kamino_token_mint.key(), false),
+            AccountMeta::new_readonly(kamino_base_vault_authority.key(), false),
+            AccountMeta::new(kamino_shares_mint.key(), false),
+            AccountMeta::new(vault_backing_token_account.key(), false),
+            AccountMeta::new(vault_shares_token_account.key(), false),
+            AccountMeta::new_readonly(klend_program.key(), false),
+            AccountMeta::new_readonly(token_program.key(), false),
+            AccountMeta::new_readonly(shares_token_program.key(), false),
+            AccountMeta::new_readonly(kamino_event_authority.key(), false),
+            AccountMeta::new_readonly(kamino_program.key(), false),
+        ],
+        data: ix_data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            vault.to_account_info(),
+            kamino_vault_state.clone(),
+            kamino_token_vault.clone(),
+            kamino_token_mint.clone(),
+            kamino_base_vault_authority.clone(),
+            kamino_shares_mint.clone(),
+            vault_backing_token_account.clone(),
+            vault_shares_token_account.clone(),
+            klend_program.clone(),
+            token_program.clone(),
+            shares_token_program.clone(),
+            kamino_event_authority.clone(),
+            kamino_program.clone(),
+        ],
+        signer_seeds,
+    )?;
+
+    Ok(())
+}
+
+fn invoke_kamino_withdraw<'info>(
+    cvct_mint_key: Pubkey,
+    vault: AccountInfo<'info>,
+    kamino_vault_state: AccountInfo<'info>,
+    kamino_global_config: AccountInfo<'info>,
+    kamino_token_vault: AccountInfo<'info>,
+    kamino_base_vault_authority: AccountInfo<'info>,
+    vault_backing_token_account: AccountInfo<'info>,
+    kamino_token_mint: AccountInfo<'info>,
+    vault_shares_token_account: AccountInfo<'info>,
+    kamino_shares_mint: AccountInfo<'info>,
+    token_program: AccountInfo<'info>,
+    shares_token_program: AccountInfo<'info>,
+    klend_program: AccountInfo<'info>,
+    kamino_event_authority: AccountInfo<'info>,
+    kamino_program: AccountInfo<'info>,
+    vault_bump: u8,
+    shares_amount: u64,
+) -> Result<()> {
+    let vault_seeds = &[b"vault".as_ref(), cvct_mint_key.as_ref(), &[vault_bump]];
+    let signer_seeds = &[&vault_seeds[..]];
+
+    let ix_data = kamino_vault::instruction::WithdrawFromAvailable {
+        _shares_amount: shares_amount,
+    }
+    .data();
+    let ix = Instruction {
+        program_id: kamino_program.key(),
+        accounts: vec![
+            AccountMeta::new(vault.key(), true),
+            AccountMeta::new(kamino_vault_state.key(), false),
+            AccountMeta::new_readonly(kamino_global_config.key(), false),
+            AccountMeta::new(kamino_token_vault.key(), false),
+            AccountMeta::new_readonly(kamino_base_vault_authority.key(), false),
+            AccountMeta::new(vault_backing_token_account.key(), false),
+            AccountMeta::new(kamino_token_mint.key(), false),
+            AccountMeta::new(vault_shares_token_account.key(), false),
+            AccountMeta::new(kamino_shares_mint.key(), false),
+            AccountMeta::new_readonly(token_program.key(), false),
+            AccountMeta::new_readonly(shares_token_program.key(), false),
+            AccountMeta::new_readonly(klend_program.key(), false),
+            AccountMeta::new_readonly(kamino_event_authority.key(), false),
+            AccountMeta::new_readonly(kamino_program.key(), false),
+        ],
+        data: ix_data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            vault.to_account_info(),
+            kamino_vault_state.clone(),
+            kamino_global_config.clone(),
+            kamino_token_vault.clone(),
+            kamino_base_vault_authority.clone(),
+            vault_backing_token_account.clone(),
+            kamino_token_mint.clone(),
+            vault_shares_token_account.clone(),
+            kamino_shares_mint.clone(),
+            token_program.clone(),
+            shares_token_program.clone(),
+            klend_program.clone(),
+            kamino_event_authority.clone(),
+            kamino_program.clone(),
+        ],
+        signer_seeds,
+    )?;
+
+    Ok(())
 }
 
 fn is_terminal_status(status: u8) -> bool {
@@ -1739,6 +2090,36 @@ pub struct OperationSettledEvent {
     pub kind: u8,
     pub final_status: u8,
     pub amount_out: u64,
+}
+
+#[event]
+pub struct KaminoPolicyUpdatedEvent {
+    pub cvct_mint: Pubkey,
+    pub threshold_bps: u16,
+    pub redeem_withdraw_buffer_amount: u64,
+}
+
+#[event]
+pub struct TreasuryRebalancedEvent {
+    pub cvct_mint: Pubkey,
+    pub threshold_bps: u16,
+    pub liquid_total: u64,
+    pub idle_before: u64,
+    pub target_idle: u64,
+    pub deposited_to_kamino: u64,
+    pub idle_after: u64,
+}
+
+#[event]
+pub struct RedeemLiquidityPulledEvent {
+    pub cvct_mint: Pubkey,
+    pub operation_id: u64,
+    pub idle_before: u64,
+    pub idle_after: u64,
+    pub assets_requested: u64,
+    pub target_pull_assets: u64,
+    pub assets_pulled: u64,
+    pub shares_burned: u64,
 }
 
 #[queue_computation_accounts("init_mint_state", authority)]
@@ -2585,6 +2966,23 @@ pub struct ConfigureKaminoAdapter<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateKaminoPolicy<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
+    )]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"kamino_adapter", cvct_mint.key().as_ref()],
+        bump,
+        constraint = kamino_adapter.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidKaminoAdapterConfig,
+    )]
+    pub kamino_adapter: Box<Account<'info, KaminoAdapterState>>,
+}
+
+#[derive(Accounts)]
 pub struct KaminoDepositIdle<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -2660,6 +3058,82 @@ pub struct KaminoDepositIdle<'info> {
     pub klend_program: UncheckedAccount<'info>,
     pub token_program: Program<'info, Token>,
     /// Classic SPL Token program for Kamino shares accounts in the current adapter.
+    pub shares_token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct RebalanceIdleLiquidity<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
+    )]
+    pub cvct_mint: Box<Account<'info, CvctMint>>,
+    #[account(
+        mut,
+        seeds = [b"vault", cvct_mint.key().as_ref()],
+        bump,
+        constraint = vault.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidVault,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+    #[account(
+        constraint = kamino_adapter.cvct_mint == cvct_mint.key() @ ErrorCode::InvalidKaminoAdapterConfig,
+        constraint = kamino_adapter.enabled @ ErrorCode::KaminoAdapterDisabled,
+    )]
+    pub kamino_adapter: Box<Account<'info, KaminoAdapterState>>,
+    #[account(
+        mut,
+        constraint = vault_backing_token_account.key() == vault.backing_token_account @ ErrorCode::InvalidVault
+    )]
+    pub vault_backing_token_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = vault_shares_token_account.owner == vault.key() @ ErrorCode::InvalidKaminoAdapterConfig,
+        constraint = vault_shares_token_account.mint == kamino_adapter.shares_mint @ ErrorCode::InvalidKaminoAdapterConfig,
+    )]
+    pub vault_shares_token_account: Account<'info, TokenAccount>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_vault_state.key() == kamino_adapter.vault_state @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_vault_state: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_token_vault.key() == kamino_adapter.token_vault @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_token_vault: Account<'info, TokenAccount>,
+    /// CHECK: validated against CVCT backing mint.
+    #[account(
+        constraint = kamino_token_mint.key() == cvct_mint.backing_mint @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_token_mint: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = kamino_base_vault_authority.key() == kamino_adapter.base_vault_authority @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_base_vault_authority: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        mut,
+        constraint = kamino_shares_mint.key() == kamino_adapter.shares_mint @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_shares_mint: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = kamino_event_authority.key() == kamino_adapter.event_authority @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub kamino_event_authority: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(address = KAMINO_VAULT_ID)]
+    pub kamino_program: UncheckedAccount<'info>,
+    /// CHECK: validated against adapter state.
+    #[account(
+        constraint = klend_program.key() == kamino_adapter.klend_program @ ErrorCode::InvalidKaminoAdapterConfig
+    )]
+    pub klend_program: UncheckedAccount<'info>,
+    pub token_program: Program<'info, Token>,
     pub shares_token_program: Program<'info, Token>,
 }
 
@@ -3032,4 +3506,10 @@ pub enum ErrorCode {
     KaminoAdapterDisabled,
     #[msg("Invalid Kamino adapter configuration or account wiring")]
     InvalidKaminoAdapterConfig,
+    #[msg("Invalid Kamino policy configuration")]
+    InvalidKaminoPolicy,
+    #[msg("Invalid Kamino liquidity state")]
+    InvalidKaminoLiquidityState,
+    #[msg("Missing Kamino accounts required for redeem settlement")]
+    MissingKaminoAccountsForRedeem,
 }

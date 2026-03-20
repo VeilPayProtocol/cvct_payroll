@@ -30,8 +30,11 @@ import {
   KAMINO_KLEND_PROGRAM_ID,
   KAMINO_VAULT_PROGRAM_ID,
   kaminoDepositIdle,
+  kaminoRedeemRemainingAccounts,
   kaminoWithdrawToVault,
+  rebalanceIdleLiquidity,
   shouldRunKaminoLocalTests,
+  updateKaminoPolicy,
   vaultBackedTokenAmount,
   vaultSharesTokenAmount,
 } from "./helpers/kaminoLocal";
@@ -89,6 +92,8 @@ describe("Cvct Kamino Adapter", () => {
     expect(adapter.enabled).to.eq(true);
     expect(adapter.cvctMint.toBase58()).to.eq(fixture.cvctMintPda.toBase58());
     expect(adapter.vaultState.toBase58()).to.eq(vaultState.toBase58());
+    expect(adapter.idleLiquidityThresholdBps).to.eq(0);
+    expect(adapter.redeemWithdrawBufferAmount.toNumber()).to.eq(0);
   });
 
   it("rejects invalid kamino adapter PDA wiring during configuration", async () => {
@@ -126,36 +131,40 @@ describe("Cvct Kamino Adapter", () => {
     );
   });
 
-  itLocalOnly("manually deposits idle vault assets into kamino and withdraws them back", async () => {
+  itLocalOnly("rejects invalid kamino threshold values", async () => {
     const harness = await createHarness(false);
     const fixture = await createFixture(harness);
     const kamino = await bootstrapKaminoVault(fixture);
     const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+
+    await expectRpcFailure(
+      updateKaminoPolicy(fixture, kaminoAdapterPda, 10_001),
+      "Invalid Kamino policy configuration",
+    );
+  });
+
+  itLocalOnly("rebalances excess idle vault assets into kamino from the configured threshold", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+    const kamino = await bootstrapKaminoVault(fixture);
+    const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 2_000, 0);
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
     await finalizeAndSettleDeposit(fixture, depositReq);
 
     const beforeKaminoDeposit = await vaultBackedTokenAmount(fixture);
-    await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 300_000);
+    await rebalanceIdleLiquidity(fixture, kaminoAdapterPda, kamino);
     const afterKaminoDeposit = await vaultBackedTokenAmount(fixture);
     const sharesAfterDeposit = await vaultSharesTokenAmount(
       kamino,
       harness.connection,
     );
 
-    expect(afterKaminoDeposit).to.be.lessThan(beforeKaminoDeposit);
+    expect(afterKaminoDeposit).to.equal(100_000);
+    expect(beforeKaminoDeposit - afterKaminoDeposit).to.equal(400_000);
     expect(sharesAfterDeposit).to.be.greaterThan(0);
-
-    await kaminoWithdrawToVault(
-      fixture,
-      kaminoAdapterPda,
-      kamino,
-      sharesAfterDeposit,
-    );
-    const afterKaminoWithdraw = await vaultBackedTokenAmount(fixture);
-
-    expect(afterKaminoWithdraw).to.be.greaterThan(afterKaminoDeposit);
   });
 
   itLocalOnly("rejects treasury actions when the adapter is disabled", async () => {
@@ -194,19 +203,25 @@ describe("Cvct Kamino Adapter", () => {
       kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 100_000),
       "Kamino adapter is disabled",
     );
+    await expectRpcFailure(
+      rebalanceIdleLiquidity(fixture, kaminoAdapterPda, kamino),
+      "Kamino adapter is disabled",
+    );
   });
 
-  itLocalOnly("requires manual kamino withdraw before redeem settle when idle liquidity is low", async () => {
+  itLocalOnly("auto-withdraws from kamino during redeem settle when idle liquidity is low", async () => {
     const harness = await createHarness(false);
     const fixture = await createFixture(harness);
     const kamino = await bootstrapKaminoVault(fixture);
     const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 0, 75_000);
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
     await finalizeAndSettleDeposit(fixture, depositReq);
 
     await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 400_000);
+    const sharesBeforeSettle = await vaultSharesTokenAmount(kamino, harness.connection);
 
     const redeemQuote = previewRedeemAssets(
       fixture.burnAmount,
@@ -216,21 +231,24 @@ describe("Cvct Kamino Adapter", () => {
     const redeemReq = await requestRedeem(fixture, fixture.burnAmount, redeemQuote);
     await awaitOperationComputation(fixture, redeemReq);
     const beforeState = await getDecryptedState(fixture);
+    const idleBeforeSettle = await vaultBackedTokenAmount(fixture);
 
-    await expectRpcFailure(
-      settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda),
-      "Insufficient idle vault liquidity for redeem settlement",
+    await settleRedeemCall(
+      fixture,
+      redeemReq.operationPda,
+      redeemReq.redeemResultPda,
+      kaminoRedeemRemainingAccounts(kaminoAdapterPda, fixture, kamino),
     );
-    const afterFailedSettle = await getDecryptedState(fixture);
-    expect(afterFailedSettle.decryptedBalance).to.equal(beforeState.decryptedBalance);
-    expect(afterFailedSettle.decryptedSupply).to.equal(beforeState.decryptedSupply);
-    expect(afterFailedSettle.decryptedLocked).to.equal(beforeState.decryptedLocked);
-
-    const sharesBalance = await vaultSharesTokenAmount(kamino, harness.connection);
-    await kaminoWithdrawToVault(fixture, kaminoAdapterPda, kamino, sharesBalance);
-    await settleRedeemCall(fixture, redeemReq.operationPda, redeemReq.redeemResultPda);
+    const idleAfterSettle = await vaultBackedTokenAmount(fixture);
+    const sharesAfterSettle = await vaultSharesTokenAmount(kamino, harness.connection);
+    expect(idleAfterSettle).to.be.greaterThan(0);
+    expect(idleAfterSettle).to.be.lessThan(idleBeforeSettle);
+    expect(idleAfterSettle).to.be.closeTo(75_000, 2_000);
+    expect(sharesAfterSettle).to.be.greaterThan(0);
+    expect(sharesAfterSettle).to.be.lessThan(sharesBeforeSettle);
 
     const state = await getDecryptedState(fixture);
+    expect(beforeState.decryptedBalance).to.equal(BigInt(fixture.depositAmount));
     expect(state.decryptedSupply).to.equal(BigInt(fixture.depositAmount - fixture.burnAmount));
     expect(state.decryptedLocked).to.equal(BigInt(fixture.depositAmount - fixture.burnAmount));
   });
