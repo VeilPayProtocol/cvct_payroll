@@ -5,6 +5,7 @@ import {
   finalizeAndSettleDeposit,
   requestDeposit,
   requestRedeem,
+  settleDepositCall,
   settleRedeemCall,
 } from "./helpers/cvctFlows";
 import {
@@ -20,6 +21,7 @@ import {
   expectRpcFailure,
   fetchPendingStatus,
   fetchPricingVersion,
+  waitForPendingDepositCallback,
 } from "./helpers/cvctAssertions";
 import {
   assertKaminoArtifactsPresent,
@@ -29,6 +31,7 @@ import {
   deriveKaminoPdas,
   KAMINO_KLEND_PROGRAM_ID,
   KAMINO_VAULT_PROGRAM_ID,
+  kaminoDepositRemainingAccounts,
   kaminoDepositIdle,
   kaminoRedeemRemainingAccounts,
   kaminoWithdrawToVault,
@@ -92,7 +95,7 @@ describe("Cvct Kamino Adapter", () => {
     expect(adapter.enabled).to.eq(true);
     expect(adapter.cvctMint.toBase58()).to.eq(fixture.cvctMintPda.toBase58());
     expect(adapter.vaultState.toBase58()).to.eq(vaultState.toBase58());
-    expect(adapter.idleLiquidityThresholdBps).to.eq(0);
+    expect(adapter.idleLiquidityThresholdBps).to.eq(10_000);
     expect(adapter.redeemWithdrawBufferAmount.toNumber()).to.eq(0);
   });
 
@@ -143,7 +146,7 @@ describe("Cvct Kamino Adapter", () => {
     );
   });
 
-  itLocalOnly("rebalances excess idle vault assets into kamino from the configured threshold", async () => {
+  itLocalOnly("auto-deploys excess idle vault assets into kamino during deposit settle", async () => {
     const harness = await createHarness(false);
     const fixture = await createFixture(harness);
     const kamino = await bootstrapKaminoVault(fixture);
@@ -152,10 +155,13 @@ describe("Cvct Kamino Adapter", () => {
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
-
     const beforeKaminoDeposit = await vaultBackedTokenAmount(fixture);
-    await rebalanceIdleLiquidity(fixture, kaminoAdapterPda, kamino);
+    await finalizeAndSettleDeposit(
+      fixture,
+      depositReq,
+      kaminoDepositRemainingAccounts(kaminoAdapterPda, fixture, kamino),
+    );
+
     const afterKaminoDeposit = await vaultBackedTokenAmount(fixture);
     const sharesAfterDeposit = await vaultSharesTokenAmount(
       kamino,
@@ -163,8 +169,63 @@ describe("Cvct Kamino Adapter", () => {
     );
 
     expect(afterKaminoDeposit).to.equal(100_000);
-    expect(beforeKaminoDeposit - afterKaminoDeposit).to.equal(400_000);
+    expect(fixture.depositAmount - afterKaminoDeposit).to.equal(400_000);
+    expect(beforeKaminoDeposit).to.equal(0);
     expect(sharesAfterDeposit).to.be.greaterThan(0);
+  });
+
+  itLocalOnly("keeps manual rebalance available as an operator escape hatch", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+    const kamino = await bootstrapKaminoVault(fixture);
+    const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 10_000, 0);
+
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await finalizeAndSettleDeposit(
+      fixture,
+      depositReq,
+      kaminoDepositRemainingAccounts(kaminoAdapterPda, fixture, kamino),
+    );
+
+    const beforeManualRebalance = await vaultBackedTokenAmount(fixture);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 2_000, 0);
+    await rebalanceIdleLiquidity(fixture, kaminoAdapterPda, kamino);
+    const afterManualRebalance = await vaultBackedTokenAmount(fixture);
+
+    expect(beforeManualRebalance).to.equal(fixture.depositAmount);
+    expect(afterManualRebalance).to.equal(100_000);
+  });
+
+  itLocalOnly("fails deposit settle atomically when enabled adapter accounts are missing", async () => {
+    const harness = await createHarness(false);
+    const fixture = await createFixture(harness);
+    const kamino = await bootstrapKaminoVault(fixture);
+    const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 2_000, 0);
+
+    const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
+    const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
+    await waitForPendingDepositCallback(
+      fixture,
+      depositReq.operationPda,
+      depositReq.depositResultPda!,
+    );
+    const beforeState = await getDecryptedState(fixture);
+    const idleBefore = await vaultBackedTokenAmount(fixture);
+
+    await expectRpcFailure(
+      settleDepositCall(fixture, depositReq.operationPda, depositReq.depositResultPda),
+      "Missing Kamino accounts required for deposit settlement",
+    );
+
+    const idleAfter = await vaultBackedTokenAmount(fixture);
+    const afterState = await getDecryptedState(fixture);
+    expect(idleAfter).to.equal(idleBefore);
+    expect(afterState.decryptedBalance).to.equal(beforeState.decryptedBalance);
+    expect(afterState.decryptedSupply).to.equal(beforeState.decryptedSupply);
+    expect(afterState.decryptedLocked).to.equal(beforeState.decryptedLocked);
   });
 
   itLocalOnly("rejects treasury actions when the adapter is disabled", async () => {
@@ -214,11 +275,15 @@ describe("Cvct Kamino Adapter", () => {
     const fixture = await createFixture(harness);
     const kamino = await bootstrapKaminoVault(fixture);
     const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
-    await updateKaminoPolicy(fixture, kaminoAdapterPda, 0, 75_000);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 10_000, 75_000);
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
+    await finalizeAndSettleDeposit(
+      fixture,
+      depositReq,
+      kaminoDepositRemainingAccounts(kaminoAdapterPda, fixture, kamino),
+    );
 
     await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 400_000);
     const sharesBeforeSettle = await vaultSharesTokenAmount(kamino, harness.connection);
@@ -258,10 +323,15 @@ describe("Cvct Kamino Adapter", () => {
     const fixture = await createFixture(harness);
     const kamino = await bootstrapKaminoVault(fixture);
     const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 10_000, 0);
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
+    await finalizeAndSettleDeposit(
+      fixture,
+      depositReq,
+      kaminoDepositRemainingAccounts(kaminoAdapterPda, fixture, kamino),
+    );
     await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 250_000);
 
     const sharesBalance = await vaultSharesTokenAmount(kamino, harness.connection);
@@ -299,10 +369,15 @@ describe("Cvct Kamino Adapter", () => {
     const fixture = await createFixture(harness);
     const kamino = await bootstrapKaminoVault(fixture);
     const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 10_000, 0);
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
+    await finalizeAndSettleDeposit(
+      fixture,
+      depositReq,
+      kaminoDepositRemainingAccounts(kaminoAdapterPda, fixture, kamino),
+    );
 
     await kaminoDepositIdle(fixture, kaminoAdapterPda, kamino, 250_000);
     const vaultBefore = await harness.program.account.vault.fetch(fixture.vaultPda);
@@ -332,10 +407,15 @@ describe("Cvct Kamino Adapter", () => {
     const fixture = await createFixture(harness);
     const kamino = await bootstrapKaminoVault(fixture);
     const kaminoAdapterPda = await configureCvctKaminoAdapter(fixture, kamino);
+    await updateKaminoPolicy(fixture, kaminoAdapterPda, 10_000, 0);
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
+    await finalizeAndSettleDeposit(
+      fixture,
+      depositReq,
+      kaminoDepositRemainingAccounts(kaminoAdapterPda, fixture, kamino),
+    );
 
     const redeemQuote = previewRedeemAssets(
       fixture.burnAmount,
@@ -379,7 +459,11 @@ describe("Cvct Kamino Adapter", () => {
 
     const depositQuote = previewDepositShares(fixture.depositAmount, 0, 0);
     const depositReq = await requestDeposit(fixture, fixture.depositAmount, depositQuote);
-    await finalizeAndSettleDeposit(fixture, depositReq);
+    await finalizeAndSettleDeposit(
+      fixture,
+      depositReq,
+      kaminoDepositRemainingAccounts(kaminoAdapterPda, fixture, kamino),
+    );
 
     const redeemQuote = previewRedeemAssets(
       fixture.burnAmount,

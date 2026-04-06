@@ -57,14 +57,20 @@ If the pricing or user balance version changed underneath the request, the opera
 Success path:
 1. validate staged result
 2. transfer backing assets from user token account into vault token account
-3. commit staged encrypted state into canonical accounts
-4. increment `pricing_version`
-5. increment user `balance_version`
-6. mark operation `Settled`
+3. if the Kamino adapter is enabled, compute idle excess against the configured threshold
+4. if excess exists, deposit only that excess into Kamino
+5. commit staged encrypted state into canonical accounts
+6. increment `pricing_version`
+7. increment user `balance_version`
+8. mark operation `Settled`
 
 Failure path:
 - if callback computed `ok = false`, mark operation `Failed`
 - no custody movement
+
+Adapter-required failure path:
+- if the adapter is enabled and Kamino deposit accounts are missing, miswired, or the CPI fails, the entire transaction reverts
+- user custody and canonical confidential state both remain unchanged
 
 ### Cancel and expire
 Deposits also support:
@@ -101,7 +107,7 @@ If the pricing or user balance version changed underneath the request, the opera
 
 Success path:
 1. validate staged result
-2. check idle liquidity
+2. if idle liquidity is short and the Kamino adapter is enabled, withdraw `deficit + redeem buffer` from Kamino
 3. transfer backing assets from vault token account to user token account
 4. commit staged confidential burn state into canonical accounts
 5. increment `pricing_version`
@@ -109,7 +115,7 @@ Success path:
 7. mark operation `Settled`
 
 Low-liquidity path:
-- return `InsufficientIdleLiquidity`
+- if Kamino is disabled or cannot supply enough liquidity, return `InsufficientIdleLiquidity`
 - leave the operation in `ComputedSuccess`
 - do not mutate canonical state
 

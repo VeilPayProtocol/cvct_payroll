@@ -7,7 +7,8 @@ Today, the codebase implements a confidential, vault-backed accounting system th
 - accept deposits of a backing SPL asset into protocol custody
 - maintain private per-user balances and private global accounting via Arcium MPC
 - settle deposit and redeem flows with staged commits rather than immediate callback mutation
-- deploy idle treasury assets into Kamino without putting Kamino CPI in the user hot path
+- deploy idle treasury assets into Kamino inline during deposit settlement
+- pull buffered liquidity from Kamino inline during low-idle redeem settlement
 
 The direction is intentional:
 
@@ -23,7 +24,7 @@ In practical terms, the current system already fits:
 - private treasury balances
 - private sub-accounting for teams, desks, or beneficiaries
 - private payroll or grant distribution balances
-- yield deployment of idle assets through an explicit treasury adapter
+- yield deployment of idle assets through an onchain treasury adapter
 
 The protocol is built around four ideas:
 
@@ -50,7 +51,7 @@ That means the protocol should be described and evolved as:
 
 1. `request_deposit_intent` records a deposit intent and queues Arcium computation.
 2. `deposit_and_mint_callback` writes a staged result only.
-3. `settle_deposit_commit` transfers backing assets into the vault and commits the staged confidential state.
+3. `settle_deposit_commit` transfers backing assets into the vault, optionally deploys excess idle liquidity into Kamino, and commits the staged confidential state.
 
 Operationally, this is treasury funding into private balances, not just minting a token.
 
@@ -58,7 +59,7 @@ Operationally, this is treasury funding into private balances, not just minting 
 
 1. `request_redeem_intent` records a redeem intent and queues Arcium computation.
 2. `burn_and_withdraw_callback` writes a staged result only.
-3. `settle_redeem_commit` pays assets out of the vault and commits the staged confidential burn state.
+3. `settle_redeem_commit` pays assets out of the vault, auto-pulling buffered liquidity from Kamino when idle liquidity is short, and commits the staged confidential burn state.
 
 Operationally, this is private balance redemption back into spendable assets.
 
@@ -71,16 +72,27 @@ This is the internal movement primitive for private allocations, payroll balance
 
 ### Treasury / Kamino
 
-Kamino is intentionally outside the deposit and redeem hot paths.
+Kamino is now wired into the settlement instructions that naturally own liquidity transitions:
+- deposit settle can deploy excess idle liquidity into Kamino
+- redeem settle can pull buffered liquidity back from Kamino when the idle vault is short
 
-The protocol uses explicit treasury instructions:
+The protocol still exposes explicit treasury instructions:
 
 - `configure_kamino_adapter`
+- `update_kamino_policy`
 - `kamino_deposit_idle`
 - `kamino_withdraw_to_vault`
+- `rebalance_idle_liquidity`
 - `sync_total_assets_from_adapter`
 
-That keeps user-critical settlement logic smaller, easier to reason about, and safer to retry. It also matches the intended product shape: yield deployment is a treasury operation, not a mandatory dependency on every user flow.
+The active policy is:
+- keep a configurable idle liquidity threshold in the vault
+- deploy only excess idle liquidity into Kamino on deposit settle
+- pull `deficit + redeem buffer` from Kamino on low-idle redeem settle
+
+New adapters default to a `10_000` BPS idle threshold, so enabling Kamino does not auto-deploy funds until policy is explicitly updated.
+
+Manual instructions remain available as operator escape hatches and testing tools.
 
 ## Core safety properties
 
@@ -88,6 +100,8 @@ That keeps user-critical settlement logic smaller, easier to reason about, and s
 - Settlement is blocked until callback-visible staged state exists.
 - Stale staged operations invalidate if pricing state changed.
 - Stale staged operations invalidate if the user's balance changed.
+- Deposit settlement reverts atomically if inline Kamino deployment is required and fails.
+- Redeem settlement reverts atomically if inline Kamino withdrawal cannot satisfy the payout.
 - Failed transfers do not mutate canonical balances or versions.
 - No-op syncs do not invalidate staged operations.
 - Operation-purpose PDAs can be explicitly cleaned up after terminal completion.
@@ -104,7 +118,7 @@ These properties matter because CVCT is trying to be a reliable private treasury
 - `PendingDepositResult`: staged deposit result
 - `PendingRedeemResult`: staged redeem result
 - `PendingTransferResult`: staged transfer result
-- `KaminoAdapterState`: manual treasury adapter configuration
+- `KaminoAdapterState`: Kamino wiring plus idle-threshold and redeem-buffer policy
 
 ## Repository layout
 

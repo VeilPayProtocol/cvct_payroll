@@ -767,7 +767,8 @@ export async function requestRedeem(
 
 export async function finalizeAndSettleDeposit(
   fixture: Fixture,
-  req: RequestResult
+  req: RequestResult,
+  remainingAccounts?: anchor.web3.AccountMeta[]
 ): Promise<void> {
   await timed("finalizeAndSettleDeposit", async () => {
     const { harness } = fixture;
@@ -779,20 +780,12 @@ export async function finalizeAndSettleDeposit(
     );
 
     await rpcWithLogs(
-      (harness.program.methods as any)
-        .settleDepositCommit()
-        .accountsPartial({
-          user: harness.payer.publicKey,
-          cvctMint: fixture.cvctMintPda,
-          pricingState: fixture.pricingStatePda,
-          vault: fixture.vaultPda,
-          pendingOperation: req.operationPda,
-          pendingDepositResult: req.depositResultPda,
-          vaultTokenAccount: fixture.vaultTokenAccount,
-          userTokenAccount: fixture.userTokenAccount,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([harness.payer.payer])
+      buildSettleDepositTx(
+        fixture,
+        req.operationPda,
+        req.depositResultPda,
+        remainingAccounts
+      )
         .rpc(TEST_RPC_OPTIONS),
       "settleDepositCommit",
       harness.provider.connection
@@ -1280,9 +1273,15 @@ export async function assertTokenBalances(
 export async function settleDepositCall(
   fixture: Fixture,
   operationPda: PublicKey,
-  depositResultPda?: PublicKey
+  depositResultPda?: PublicKey,
+  remainingAccounts?: anchor.web3.AccountMeta[]
 ): Promise<unknown> {
-  return buildSettleDepositTx(fixture, operationPda, depositResultPda).rpc(
+  return buildSettleDepositTx(
+    fixture,
+    operationPda,
+    depositResultPda,
+    remainingAccounts
+  ).rpc(
     TEST_RPC_OPTIONS
   );
 }
@@ -1290,9 +1289,10 @@ export async function settleDepositCall(
 function buildSettleDepositTx(
   fixture: Fixture,
   operationPda: PublicKey,
-  depositResultPda?: PublicKey
+  depositResultPda?: PublicKey,
+  remainingAccounts?: anchor.web3.AccountMeta[]
 ) {
-  return (fixture.harness.program.methods as any)
+  const builder = (fixture.harness.program.methods as any)
     .settleDepositCommit()
     .accountsPartial({
       user: fixture.harness.payer.publicKey,
@@ -1306,6 +1306,7 @@ function buildSettleDepositTx(
       tokenProgram: TOKEN_PROGRAM_ID,
     })
     .signers([fixture.harness.payer.payer]);
+  return remainingAccounts ? builder.remainingAccounts(remainingAccounts) : builder;
 }
 
 export async function cancelDepositIntentCall(

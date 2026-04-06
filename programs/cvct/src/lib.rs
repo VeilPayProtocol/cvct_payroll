@@ -92,6 +92,7 @@ pub mod cvct {
                 total_supply: [[0u8; 32]; ENCRYPTED_U128_CIPHERTEXTS],
                 total_supply_nonce: 0,
                 decimals,
+                kamino_adapter_enabled: false,
             });
 
             // Vault holds backing SPL tokens; encrypted total_locked updated in callback.
@@ -513,8 +514,10 @@ pub mod cvct {
         Ok(())
     }
 
-    pub fn settle_deposit_commit(ctx: Context<SettleDepositCommit>) -> Result<()> {
-        let pending_op = &mut ctx.accounts.pending_operation;
+    pub fn settle_deposit_commit<'info>(
+        ctx: Context<'_, '_, 'info, 'info, SettleDepositCommit<'info>>,
+    ) -> Result<()> {
+        let pending_op = &ctx.accounts.pending_operation;
         if is_terminal_status(pending_op.status) {
             return Ok(());
         }
@@ -528,7 +531,7 @@ pub mod cvct {
                 || pending_op.status == STATUS_COMPUTED_FAILURE,
             ErrorCode::InvalidOperationPhase
         );
-        let pending_result = &mut ctx.accounts.pending_deposit_result;
+        let pending_result = &ctx.accounts.pending_deposit_result;
         require!(
             pending_result.operation_id == pending_op.operation_id,
             ErrorCode::InvalidPendingOperation
@@ -562,6 +565,8 @@ pub mod cvct {
             || ctx.accounts.cvct_account.balance_version != pending_op.base_user_balance_version
             || ctx.accounts.cvct_account.balance_version != pending_result.base_user_balance_version
         {
+            let pending_op = &mut ctx.accounts.pending_operation;
+            let pending_result = &mut ctx.accounts.pending_deposit_result;
             pending_op.status = STATUS_INVALIDATED;
             pending_op.ok = false;
             pending_op.amount_out = 0;
@@ -577,6 +582,8 @@ pub mod cvct {
         }
 
         if pending_op.deadline_slot > 0 && Clock::get()?.slot > pending_op.deadline_slot {
+            let pending_op = &mut ctx.accounts.pending_operation;
+            let pending_result = &mut ctx.accounts.pending_deposit_result;
             pending_op.status = OperationStatus::Expired as u8;
             pending_op.ok = false;
             pending_op.amount_out = 0;
@@ -592,6 +599,7 @@ pub mod cvct {
         }
 
         if !pending_op.ok {
+            let pending_op = &mut ctx.accounts.pending_operation;
             pending_op.status = OperationStatus::Failed as u8;
             emit!(OperationSettledEvent {
                 operation_id: pending_op.operation_id,
@@ -602,6 +610,10 @@ pub mod cvct {
             return Ok(());
         }
 
+        let amount_in = pending_op.amount_in;
+        let amount_out = pending_op.amount_out;
+        let operation_id = pending_op.operation_id;
+
         transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -611,12 +623,110 @@ pub mod cvct {
                     authority: ctx.accounts.user.to_account_info(),
                 },
             ),
-            pending_op.amount_in,
+            amount_in,
         )?;
+        ctx.accounts.vault_token_account.reload()?;
+
+        if ctx.accounts.cvct_mint.kamino_adapter_enabled {
+            let remaining = ctx.remaining_accounts;
+            require!(
+                remaining.len() >= 11,
+                ErrorCode::MissingKaminoAccountsForDeposit
+            );
+
+            let kamino_adapter = Account::<KaminoAdapterState>::try_from(&remaining[0])?;
+            require!(
+                kamino_adapter.cvct_mint == ctx.accounts.cvct_mint.key(),
+                ErrorCode::InvalidKaminoAdapterConfig
+            );
+            require!(kamino_adapter.enabled, ErrorCode::KaminoAdapterDisabled);
+
+            let vault_shares_token_account = Account::<TokenAccount>::try_from(&remaining[1])?;
+            require!(
+                vault_shares_token_account.owner == ctx.accounts.vault.key(),
+                ErrorCode::InvalidKaminoAdapterConfig
+            );
+            require!(
+                vault_shares_token_account.mint == kamino_adapter.shares_mint,
+                ErrorCode::InvalidKaminoAdapterConfig
+            );
+
+            let kamino_vault_state = &remaining[2];
+            let kamino_token_vault = Account::<TokenAccount>::try_from(&remaining[3])?;
+            let kamino_token_mint = &remaining[4];
+            let kamino_base_vault_authority = &remaining[5];
+            let kamino_shares_mint = &remaining[6];
+            let kamino_event_authority = &remaining[7];
+            let kamino_program = &remaining[8];
+            let klend_program = &remaining[9];
+            let shares_token_program = &remaining[10];
+
+            require!(
+                kamino_vault_state.key() == kamino_adapter.vault_state
+                    && kamino_token_vault.key() == kamino_adapter.token_vault
+                    && kamino_token_mint.key() == ctx.accounts.cvct_mint.backing_mint
+                    && kamino_base_vault_authority.key() == kamino_adapter.base_vault_authority
+                    && kamino_shares_mint.key() == kamino_adapter.shares_mint
+                    && kamino_event_authority.key() == kamino_adapter.event_authority
+                    && kamino_program.key() == KAMINO_VAULT_ID
+                    && klend_program.key() == kamino_adapter.klend_program
+                    && shares_token_program.key() == anchor_spl::token::ID,
+                ErrorCode::InvalidKaminoAdapterConfig
+            );
+
+            let kamino_state = read_kamino_liquidity_state(
+                kamino_vault_state,
+                &kamino_token_vault,
+                &vault_shares_token_account,
+            )?;
+            let idle_before_rebalance = ctx.accounts.vault_token_account.amount;
+            let liquid_total = idle_before_rebalance
+                .checked_add(kamino_state.cvct_available_liquidity)
+                .ok_or(ErrorCode::InvalidAmount)?;
+            let target_idle = compute_threshold_amount(
+                liquid_total,
+                kamino_adapter.idle_liquidity_threshold_bps,
+            )?;
+            let deposit_amount = idle_before_rebalance.saturating_sub(target_idle);
+
+            if deposit_amount > 0 {
+                invoke_kamino_deposit(
+                    ctx.accounts.cvct_mint.key(),
+                    ctx.accounts.vault.to_account_info(),
+                    kamino_vault_state.clone(),
+                    kamino_token_vault.to_account_info(),
+                    kamino_token_mint.clone(),
+                    kamino_base_vault_authority.clone(),
+                    kamino_shares_mint.clone(),
+                    ctx.accounts.vault_token_account.to_account_info(),
+                    vault_shares_token_account.to_account_info(),
+                    klend_program.clone(),
+                    ctx.accounts.token_program.to_account_info(),
+                    shares_token_program.clone(),
+                    kamino_event_authority.clone(),
+                    kamino_program.clone(),
+                    ctx.bumps.vault,
+                    deposit_amount,
+                )?;
+                ctx.accounts.vault_token_account.reload()?;
+            }
+
+            emit!(TreasuryRebalancedEvent {
+                cvct_mint: ctx.accounts.cvct_mint.key(),
+                threshold_bps: kamino_adapter.idle_liquidity_threshold_bps,
+                liquid_total,
+                idle_before: idle_before_rebalance,
+                target_idle,
+                deposited_to_kamino: deposit_amount,
+                idle_after: ctx.accounts.vault_token_account.amount,
+            });
+        }
 
         let cvct_account = &mut ctx.accounts.cvct_account;
         let cvct_mint = &mut ctx.accounts.cvct_mint;
         let vault = &mut ctx.accounts.vault;
+        let pending_op = &mut ctx.accounts.pending_operation;
+        let pending_result = &ctx.accounts.pending_deposit_result;
 
         cvct_account.balance = pending_result.balance;
         cvct_account.balance_nonce = pending_result.balance_nonce;
@@ -637,10 +747,10 @@ pub mod cvct {
             .checked_add(1)
             .ok_or(ErrorCode::InvalidAmount)?;
         emit!(OperationSettledEvent {
-            operation_id: pending_op.operation_id,
+            operation_id,
             kind: pending_op.kind,
             final_status: pending_op.status,
-            amount_out: pending_op.amount_out,
+            amount_out,
         });
         Ok(())
     }
@@ -1264,6 +1374,11 @@ pub mod cvct {
         );
 
         let adapter = &mut ctx.accounts.kamino_adapter;
+        let is_new_adapter = adapter.cvct_mint == Pubkey::default();
+        if is_new_adapter {
+            adapter.idle_liquidity_threshold_bps = MAX_BPS;
+            adapter.redeem_withdraw_buffer_amount = 0;
+        }
         adapter.cvct_mint = ctx.accounts.cvct_mint.key();
         adapter.klend_program = config.klend_program;
         adapter.vault_state = config.vault_state;
@@ -1273,6 +1388,7 @@ pub mod cvct {
         adapter.shares_mint = config.shares_mint;
         adapter.event_authority = config.event_authority;
         adapter.enabled = config.enabled;
+        ctx.accounts.cvct_mint.kamino_adapter_enabled = config.enabled;
         Ok(())
     }
 
@@ -1619,10 +1735,11 @@ pub struct CvctMint {
     /// Nonce used with the encrypted total supply.
     pub total_supply_nonce: u128,
     pub decimals: u8,
+    pub kamino_adapter_enabled: bool,
 }
 
 impl CvctMint {
-    pub const LEN: usize = 32 + 32 + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS) + 16 + 1;
+    pub const LEN: usize = 32 + 32 + 32 + (32 * ENCRYPTED_U128_CIPHERTEXTS) + 16 + 1 + 1;
 }
 
 #[account]
@@ -2951,6 +3068,7 @@ pub struct ConfigureKaminoAdapter<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
     #[account(
+        mut,
         constraint = cvct_mint.authority == authority.key() @ ErrorCode::Unauthorized,
     )]
     pub cvct_mint: Box<Account<'info, CvctMint>>,
@@ -3512,4 +3630,6 @@ pub enum ErrorCode {
     InvalidKaminoLiquidityState,
     #[msg("Missing Kamino accounts required for redeem settlement")]
     MissingKaminoAccountsForRedeem,
+    #[msg("Missing Kamino accounts required for deposit settlement")]
+    MissingKaminoAccountsForDeposit,
 }

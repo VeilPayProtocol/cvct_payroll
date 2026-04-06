@@ -143,6 +143,7 @@ sequenceDiagram
     participant P as CVCT program
     participant A as Arcium
     participant V as Vault
+    participant K as Kamino
 
     U->>P: request_deposit_intent
     P->>A: queue deposit_and_mint computation
@@ -150,6 +151,7 @@ sequenceDiagram
     P-->>P: stage PendingDepositResult only
     U->>P: settle_deposit_commit
     P->>V: transfer backing assets into vault
+    P->>K: deposit idle excess if threshold exceeded
     P-->>P: commit canonical encrypted state
 ```
 
@@ -163,6 +165,8 @@ The current deposit path avoids that:
 
 In product terms, deposit is a treasury funding flow into private internal balances.
 
+When the Kamino adapter is enabled, deposit settlement also becomes the protocol-owned deploy step for excess idle liquidity.
+
 ## Redeem architecture
 
 ```mermaid
@@ -171,12 +175,14 @@ sequenceDiagram
     participant P as CVCT program
     participant A as Arcium
     participant V as Vault
+    participant K as Kamino
 
     U->>P: request_redeem_intent
     P->>A: queue burn_and_withdraw computation
     A-->>P: burn_and_withdraw_callback
     P-->>P: stage PendingRedeemResult only
     U->>P: settle_redeem_commit
+    P->>K: withdraw deficit plus buffer if idle is short
     P->>V: transfer backing assets to user
     P-->>P: commit canonical encrypted burn state
 ```
@@ -185,9 +191,9 @@ sequenceDiagram
 A redeem can reach `ComputedSuccess` while idle vault liquidity is insufficient.
 
 In that case:
-- settlement returns `InsufficientIdleLiquidity`
-- canonical confidential state does not change
-- treasury can withdraw liquidity from Kamino
+- settlement first attempts a Kamino pull sized as `deficit + redeem buffer`
+- canonical confidential state changes only after payout succeeds
+- if the pull still cannot satisfy the payout, settlement returns `InsufficientIdleLiquidity`
 - settlement can be retried safely
 
 In product terms, redeem is a private internal balance being converted back into spendable assets without forcing treasury deployment into the same hot path.

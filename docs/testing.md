@@ -50,9 +50,10 @@ File:
 Covers:
 - adapter config
 - invalid wiring rejection
-- manual deposit / withdraw
+- inline deposit rebalance
+- manual deposit / withdraw escape hatches
 - disabled adapter behavior
-- low-liquidity redeem retry
+- buffered low-liquidity redeem auto-withdraw
 - adapter sync behavior
 
 ## Commands

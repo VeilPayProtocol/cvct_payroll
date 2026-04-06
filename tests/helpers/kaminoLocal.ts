@@ -488,3 +488,23 @@ export function kaminoRedeemRemainingAccounts(
     { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
   ];
 }
+
+export function kaminoDepositRemainingAccounts(
+  kaminoAdapter: PublicKey,
+  fixture: Fixture,
+  kamino: KaminoVaultContext,
+): anchor.web3.AccountMeta[] {
+  return [
+    { pubkey: kaminoAdapter, isSigner: false, isWritable: false },
+    { pubkey: kamino.vaultSharesTokenAccount, isSigner: false, isWritable: true },
+    { pubkey: kamino.vaultState.publicKey, isSigner: false, isWritable: true },
+    { pubkey: kamino.tokenVault, isSigner: false, isWritable: true },
+    { pubkey: fixture.backingMint, isSigner: false, isWritable: false },
+    { pubkey: kamino.baseVaultAuthority, isSigner: false, isWritable: false },
+    { pubkey: kamino.sharesMint, isSigner: false, isWritable: true },
+    { pubkey: kamino.eventAuthority, isSigner: false, isWritable: false },
+    { pubkey: KAMINO_VAULT_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: KAMINO_KLEND_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+  ];
+}
